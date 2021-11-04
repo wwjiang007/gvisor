@@ -454,3 +454,8 @@ func (e *EventPoll) RemoveEntry(ctx context.Context, id FileIdentifier) error {
 
 	return nil
 }
+
+func (e *EventPoll) EventRegister(entry *waiter.Entry, mask waiter.EventMask) error {
+	e.Queue.EventRegister(entry, mask)
+	return nil
+}

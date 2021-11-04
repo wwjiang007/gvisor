@@ -103,7 +103,9 @@ func (fd *regularFileFD) currentFDLocked(ctx context.Context) (*vfs.FileDescript
 			ready := upperFD.Readiness(^waiter.EventMask(0))
 			for e, mask := range fd.lowerWaiters {
 				fd.cachedFD.EventUnregister(e)
-				upperFD.EventRegister(e, mask)
+				if err := upperFD.EventRegister(e, mask); err != nil {
+					return nil, err
+				}
 				if m := ready & mask; m != 0 {
 					e.Callback.Callback(e, m)
 				}
@@ -256,7 +258,7 @@ func (fd *regularFileFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (fd *regularFileFD) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (fd *regularFileFD) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	wrappedFD, err := fd.currentFDLocked(context.Background())
@@ -267,13 +269,16 @@ func (fd *regularFileFD) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
 		log.Warningf("overlay.regularFileFD.EventRegister: currentFDLocked failed: %v", err)
 		wrappedFD = fd.cachedFD
 	}
-	wrappedFD.EventRegister(e, mask)
+	if err := wrappedFD.EventRegister(e, mask); err != nil {
+		return err
+	}
 	if !fd.copiedUp {
 		if fd.lowerWaiters == nil {
 			fd.lowerWaiters = make(map[*waiter.Entry]waiter.EventMask)
 		}
 		fd.lowerWaiters[e] = mask
 	}
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.

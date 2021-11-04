@@ -351,3 +351,8 @@ func (i *Inotify) RmWatch(ctx context.Context, wd int32) error {
 
 	return nil
 }
+
+func (i *Inotify) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
+	i.Queue.EventRegister(e, mask)
+	return nil
+}

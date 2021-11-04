@@ -124,11 +124,12 @@ func (sfd *SignalFileDescription) Readiness(mask waiter.EventMask) waiter.EventM
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (sfd *SignalFileDescription) EventRegister(entry *waiter.Entry, _ waiter.EventMask) {
+func (sfd *SignalFileDescription) EventRegister(entry *waiter.Entry, _ waiter.EventMask) error {
 	sfd.mu.Lock()
 	defer sfd.mu.Unlock()
 	// Register for the signal set; ignore the passed events.
 	sfd.target.SignalRegister(entry, waiter.EventMask(sfd.mask))
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.

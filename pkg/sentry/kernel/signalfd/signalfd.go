@@ -129,9 +129,10 @@ func (s *SignalOperations) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (s *SignalOperations) EventRegister(entry *waiter.Entry, _ waiter.EventMask) {
+func (s *SignalOperations) EventRegister(entry *waiter.Entry, _ waiter.EventMask) error {
 	// Register for the signal set; ignore the passed events.
 	s.target.SignalRegister(entry, waiter.EventMask(s.Mask()))
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.

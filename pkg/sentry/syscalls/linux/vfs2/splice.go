@@ -471,7 +471,9 @@ func (dw *dualWaiter) waitForBoth(t *kernel.Task) error {
 	if dw.inFile.Readiness(eventMaskRead)&eventMaskRead == 0 {
 		if dw.inCh == nil {
 			dw.inW, dw.inCh = waiter.NewChannelEntry(nil)
-			dw.inFile.EventRegister(&dw.inW, eventMaskRead)
+			if err := dw.inFile.EventRegister(&dw.inW, eventMaskRead); err != nil {
+				return err
+			}
 			// We might be ready now. Try again before blocking.
 			return nil
 		}
@@ -490,7 +492,9 @@ func (dw *dualWaiter) waitForOut(t *kernel.Task) error {
 	// EWOULDBLOCK. See b/172075629, b/170743336.
 	if dw.outCh == nil {
 		dw.outW, dw.outCh = waiter.NewChannelEntry(nil)
-		dw.outFile.EventRegister(&dw.outW, eventMaskWrite)
+		if err := dw.outFile.EventRegister(&dw.outW, eventMaskWrite); err != nil {
+			return err
+		}
 		// We might be ready to write now. Try again before blocking.
 		return nil
 	}

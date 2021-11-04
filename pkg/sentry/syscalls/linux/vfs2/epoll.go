@@ -164,7 +164,9 @@ func waitEpoll(t *kernel.Task, epfd int32, eventsAddr hostarch.Addr, maxEvents i
 		if ch == nil {
 			var w waiter.Entry
 			w, ch = waiter.NewChannelEntry(nil)
-			epfile.EventRegister(&w, waiter.ReadableEvents)
+			if err := epfile.EventRegister(&w, waiter.ReadableEvents); err != nil {
+				return 0, nil, err
+			}
 			defer epfile.EventUnregister(&w)
 		} else {
 			// Set up the timer if a timeout was specified.

@@ -1,4 +1,4 @@
-// Copyright 2018 The gVisor Authors.
+// Copyright 2021 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,24 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package fs
+package host
 
-import "fmt"
+import (
+	"unsafe"
 
-// beforeSave is invoked by stateify.
-func (f *File) beforeSave() {
-	f.saving = true
-	if f.flags.Async && f.async != nil {
-		f.async.Unregister(f)
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+)
+
+func ioctlFionread(fd int) (uint32, error) {
+	var v uint32
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), linux.FIONREAD, uintptr(unsafe.Pointer(&v))); errno != 0 {
+		return 0, errno
 	}
-}
-
-// afterLoad is invoked by stateify.
-func (f *File) afterLoad() {
-	f.mu.Init()
-	if f.flags.Async && f.async != nil {
-		if err := f.async.Register(f); err != nil {
-			panic(fmt.Sprint("async.Register:", err))
-		}
-	}
+	return v, nil
 }

@@ -113,8 +113,9 @@ func (sf *replicaFileOperations) Release(context.Context) {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (sf *replicaFileOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (sf *replicaFileOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
 	sf.si.t.ld.replicaWaiter.EventRegister(e, mask)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.

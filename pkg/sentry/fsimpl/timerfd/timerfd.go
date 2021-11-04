@@ -112,8 +112,9 @@ func (tfd *TimerFileDescription) Readiness(mask waiter.EventMask) waiter.EventMa
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (tfd *TimerFileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (tfd *TimerFileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
 	tfd.events.EventRegister(e, mask)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.

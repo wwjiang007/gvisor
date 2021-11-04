@@ -151,8 +151,9 @@ func (ep *EpollInstance) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (ep *EpollInstance) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (ep *EpollInstance) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
 	ep.q.EventRegister(e, mask)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
@@ -205,7 +206,9 @@ func (ep *EpollInstance) AddInterest(file *FileDescription, num int32, event lin
 	epi.waiter.Callback = epi
 	ep.interest[key] = epi
 	wmask := waiter.EventMaskFromLinux(mask)
-	file.EventRegister(&epi.waiter, wmask)
+	if err := file.EventRegister(&epi.waiter, wmask); err != nil {
+		return err
+	}
 
 	// Check if the file is already ready.
 	if m := file.Readiness(wmask) & wmask; m != 0 {
@@ -275,7 +278,9 @@ func (ep *EpollInstance) ModifyInterest(file *FileDescription, num int32, event 
 	// Re-register with the new mask.
 	file.EventUnregister(&epi.waiter)
 	wmask := waiter.EventMaskFromLinux(mask)
-	file.EventRegister(&epi.waiter, wmask)
+	if err := file.EventRegister(&epi.waiter, wmask); err != nil {
+		return err
+	}
 
 	// Check if the file is already ready with the new mask.
 	if m := file.Readiness(wmask) & wmask; m != 0 {

@@ -78,7 +78,8 @@ func (FileDescriptionDefaultImpl) Readiness(mask waiter.EventMask) waiter.EventM
 
 // EventRegister implements waiter.Waitable.EventRegister analogously to
 // file_operations::poll == NULL in Linux.
-func (FileDescriptionDefaultImpl) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (FileDescriptionDefaultImpl) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
+	return linuxerr.EPERM
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister analogously to

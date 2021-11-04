@@ -107,7 +107,7 @@ type Waitable interface {
 	// EventRegister registers the given waiter entry to receive
 	// notifications when an event occurs that makes the object ready for
 	// at least one of the events in mask.
-	EventRegister(e *Entry, mask EventMask)
+	EventRegister(e *Entry, mask EventMask) error
 
 	// EventUnregister unregisters a waiter entry previously registered with
 	// EventRegister().
@@ -242,7 +242,8 @@ func (*AlwaysReady) Readiness(mask EventMask) EventMask {
 
 // EventRegister doesn't do anything because this object doesn't need to issue
 // notifications because its readiness never changes.
-func (*AlwaysReady) EventRegister(*Entry, EventMask) {
+func (*AlwaysReady) EventRegister(*Entry, EventMask) error {
+	return nil
 }
 
 // EventUnregister doesn't do anything because this object doesn't need to issue

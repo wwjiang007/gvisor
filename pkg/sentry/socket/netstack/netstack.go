@@ -3392,4 +3392,9 @@ func (s *socketOpsCommon) Type() (family int, skType linux.SockType, protocol in
 	return s.family, s.skType, s.protocol
 }
 
+func (s *socketOpsCommon) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
+	s.Queue.EventRegister(e, mask)
+	return nil
+}
+
 // LINT.ThenChange(./netstack_vfs2.go)

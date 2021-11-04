@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
@@ -248,6 +249,7 @@ func (s *SocketVFS2) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 
 // Ioctl implements vfs.FileDescriptionImpl.
 func (s *SocketVFS2) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+	log.Infof("FOO socket ioctl")
 	return netstack.Ioctl(ctx, s.ep, uio, args)
 }
 
@@ -315,8 +317,8 @@ func (s *SocketVFS2) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (s *SocketVFS2) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	s.socketOpsCommon.EventRegister(e, mask)
+func (s *SocketVFS2) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
+	return s.socketOpsCommon.EventRegister(e, mask)
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.

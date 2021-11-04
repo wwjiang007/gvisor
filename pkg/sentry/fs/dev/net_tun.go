@@ -158,8 +158,9 @@ func (n *netTunFileOperations) Readiness(mask waiter.EventMask) waiter.EventMask
 }
 
 // EventRegister implements watier.Waitable.EventRegister.
-func (n *netTunFileOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (n *netTunFileOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) error {
 	n.device.EventRegister(e, mask)
+	return nil
 }
 
 // EventUnregister implements watier.Waitable.EventUnregister.
