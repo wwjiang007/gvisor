@@ -21,6 +21,12 @@ _templates:
       BENCHMARKS_PROJECT: gvisor-benchmarks
       BENCHMARKS_TABLE: benchmarks
       BENCHMARKS_UPLOAD: true
+  release: &release
+    # This is enforce by the environment hooks on the release agents
+    # as well, only the master branch may be built there.
+    if: build.branch == "master" || build.tag != null
+    agents:
+      queue: "release"
 
 steps:
   # Run basic smoke tests before preceding to other tests.
@@ -235,3 +241,29 @@ steps:
   - <<: *benchmarks
     label: ":tensorflow: TensorFlow benchmarks"
     command: make benchmark-platforms BENCHMARKS_SUITE=tensorflow BENCHMARKS_TARGETS=test/benchmarks/ml:tensorflow_test
+
+  # Execute releases.
+  - wait
+  - <<: *release
+    label: ":ship: Go branch"
+    commands:
+      - tools/go_branch.sh
+      - git push origin go:go
+  - <<: *release
+    label: ":ship: Push all images (x86_64)"
+    commands:
+      - make push-all-images
+  - <<: *release
+    label: "ship: Push all images (aarch64)"
+      - make ARCH=aarch64 push-all-images
+  - <<: *release
+    label: ":ship: Release"
+    commands:
+      - make artifacts/x86_64
+      - make BAZEL_OPTIONS=--config=cross-aarch64 artifacts/aarch64
+      - make release RELEASE_NIGHTLY=$RELEASE_NIGHTLY
+      - cd repo && gsutil cp . gs://gvisor/releases/
+  - <<: *release
+    label: ":ship: Website Deploy"
+    commands:
+      - make website-deploy
