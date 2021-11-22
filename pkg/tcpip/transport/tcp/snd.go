@@ -746,7 +746,7 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 				}
 				seg.merge(nSeg)
 				s.writeList.Remove(nSeg)
-				nSeg.decRef()
+				nSeg.DecRef()
 			}
 			if !nextTooBig && seg.data.Size() < available {
 				// Segment is not full.
@@ -1527,7 +1527,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			} else {
 				s.SackedOut -= s.pCount(seg, s.MaxPayloadSize)
 			}
-			seg.decRef()
+			seg.DecRef()
 			ackLeft -= datalen
 		}
 
