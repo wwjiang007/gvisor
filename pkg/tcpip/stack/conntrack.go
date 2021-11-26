@@ -357,15 +357,15 @@ func getTupleIDForPacketInICMPError(pkt *PacketBuffer, getNetAndTransHdr netAndT
 	return tupleID{}, false
 }
 
-func getTupleID(pkt *PacketBuffer) (tid tupleID, isICMPError bool, ok bool) {
+func getTupleID(pkt *PacketBuffer) (tid tupleID, allowNewConn bool, ok bool) {
 	switch pkt.TransportProtocolNumber {
 	case header.TCPProtocolNumber:
 		if transHeader := header.TCP(pkt.TransportHeader().View()); len(transHeader) >= header.TCPMinimumSize {
-			return getTupleIDForRegularPacket(pkt.Network(), pkt.NetworkProtocolNumber, transHeader, pkt.TransportProtocolNumber), false, true
+			return getTupleIDForRegularPacket(pkt.Network(), pkt.NetworkProtocolNumber, transHeader, pkt.TransportProtocolNumber), true, true
 		}
 	case header.UDPProtocolNumber:
 		if transHeader := header.UDP(pkt.TransportHeader().View()); len(transHeader) >= header.UDPMinimumSize {
-			return getTupleIDForRegularPacket(pkt.Network(), pkt.NetworkProtocolNumber, transHeader, pkt.TransportProtocolNumber), false, true
+			return getTupleIDForRegularPacket(pkt.Network(), pkt.NetworkProtocolNumber, transHeader, pkt.TransportProtocolNumber), true, true
 		}
 	case header.ICMPv4ProtocolNumber:
 		icmp := header.ICMPv4(pkt.TransportHeader().View())
@@ -391,7 +391,8 @@ func getTupleID(pkt *PacketBuffer) (tid tupleID, isICMPError bool, ok bool) {
 		}
 
 		if tid, ok := getTupleIDForPacketInICMPError(pkt, v4NetAndTransHdr, header.IPv4ProtocolNumber, header.IPv4MinimumSize, ipv4.TransportProtocol()); ok {
-			return tid, true, true
+			// Do not create a new connection in response to an ICMP error.
+			return tid, false, true
 		}
 	case header.ICMPv6ProtocolNumber:
 		icmp := header.ICMPv6(pkt.TransportHeader().View())
@@ -412,7 +413,8 @@ func getTupleID(pkt *PacketBuffer) (tid tupleID, isICMPError bool, ok bool) {
 
 		// TODO(https://gvisor.dev/issue/6789): Handle extension headers.
 		if tid, ok := getTupleIDForPacketInICMPError(pkt, v6NetAndTransHdr, header.IPv6ProtocolNumber, header.IPv6MinimumSize, header.IPv6(h).TransportProtocol()); ok {
-			return tid, true, true
+			// Do not create a new connection in response to an ICMP error.
+			return tid, false, true
 		}
 	}
 
@@ -433,7 +435,7 @@ func (ct *ConnTrack) init() {
 func (ct *ConnTrack) getConnAndUpdate(pkt *PacketBuffer) *tuple {
 	// Get or (maybe) create a connection.
 	t := func() *tuple {
-		tid, isICMPError, ok := getTupleID(pkt)
+		tid, allowNewConn, ok := getTupleID(pkt)
 		if !ok {
 			return nil
 		}
@@ -449,8 +451,7 @@ func (ct *ConnTrack) getConnAndUpdate(pkt *PacketBuffer) *tuple {
 			return t
 		}
 
-		if isICMPError {
-			// Do not create a noop entry in response to an ICMP error.
+		if !allowNewConn {
 			return nil
 		}
 
