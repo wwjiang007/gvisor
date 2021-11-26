@@ -1852,6 +1852,23 @@ func tcpv4Packet(srcAddr, dstAddr tcpip.Address, srcPort, dstPort uint16, dataSi
 	return hdr.View()
 }
 
+func icmpv4Packet(srcAddr, dstAddr tcpip.Address, ident uint16) buffer.View {
+	hdr := buffer.NewPrependable(header.IPv4MinimumSize + header.ICMPv4MinimumSize)
+	icmp := header.ICMPv4(hdr.Prepend(header.ICMPv4MinimumSize))
+	icmp.SetType(header.ICMPv4Echo)
+	icmp.SetIdent(ident)
+	icmp.SetChecksum(0)
+	icmp.SetChecksum(^header.Checksum(icmp, 0))
+	encodeIPv4Header(
+		hdr.Prepend(header.IPv4MinimumSize),
+		hdr.UsedLength(),
+		header.ICMPv4ProtocolNumber,
+		srcAddr,
+		dstAddr,
+	)
+	return hdr.View()
+}
+
 func udpv6Packet(srcAddr, dstAddr tcpip.Address, srcPort, dstPort uint16, dataSize int) buffer.View {
 	udpSize := header.UDPMinimumSize + dataSize
 	hdr := buffer.NewPrependable(header.IPv6MinimumSize + udpSize)
@@ -1893,6 +1910,27 @@ func tcpv6Packet(srcAddr, dstAddr tcpip.Address, srcPort, dstPort uint16, dataSi
 		hdr.Prepend(header.IPv6MinimumSize),
 		len(tcp),
 		header.TCPProtocolNumber,
+		srcAddr,
+		dstAddr,
+	)
+	return hdr.View()
+}
+
+func icmpv6Packet(srcAddr, dstAddr tcpip.Address, ident uint16) buffer.View {
+	hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.ICMPv6MinimumSize)
+	icmp := header.ICMPv6(hdr.Prepend(header.ICMPv6MinimumSize))
+	icmp.SetType(header.ICMPv6EchoRequest)
+	icmp.SetIdent(ident)
+	icmp.SetChecksum(0)
+	icmp.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header: icmp,
+		Src:    srcAddr,
+		Dst:    dstAddr,
+	}))
+	encodeIPv6Header(
+		hdr.Prepend(header.IPv6MinimumSize),
+		len(icmp),
+		header.ICMPv6ProtocolNumber,
 		srcAddr,
 		dstAddr,
 	)
@@ -2296,25 +2334,69 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 		last  uint16
 	}
 
-	type transportTypeTest struct {
-		name       string
-		proto      tcpip.TransportProtocolNumber
-		buf        func(tcpip.Address, uint16) buffer.View
-		checkNATed func(*testing.T, buffer.View, uint16, bool, portRange)
+	type srcPortOrIdentRangeTest struct {
+		name          string
+		originalRange portRange
+		targetRange   portRange
 	}
 
-	compareSrcPort := func(t *testing.T, gotPort uint16, originalSrcPort uint16, firstPacket bool, expectedRange portRange) {
+	srcPortRanges := []srcPortOrIdentRangeTest{
+		{
+			name:          "Less than 512",
+			originalRange: portRange{first: 1, last: 511},
+			targetRange:   portRange{first: 1, last: 511},
+		},
+		{
+			name:          "Greater than or equal to 512 but less than 1024",
+			originalRange: portRange{first: 512, last: 1023},
+			targetRange:   portRange{first: 1, last: 1023},
+		},
+		{
+			name:          "Greater than or equal to 1024",
+			originalRange: portRange{first: 1024, last: math.MaxUint16},
+			targetRange:   portRange{first: 1024, last: math.MaxUint16},
+		},
+	}
+
+	// Unlike TCP/UDP, the Ident may be mapped to any valid value.
+	identRanges := []srcPortOrIdentRangeTest{
+		{
+			name:          "Less than 512",
+			originalRange: portRange{first: 1, last: 511},
+			targetRange:   portRange{first: 1, last: math.MaxUint16},
+		},
+		{
+			name:          "Greater than or equal to 512 but less than 1024",
+			originalRange: portRange{first: 512, last: 1023},
+			targetRange:   portRange{first: 1, last: math.MaxUint16},
+		},
+		{
+			name:          "Greater than or equal to 1024",
+			originalRange: portRange{first: 1024, last: math.MaxUint16},
+			targetRange:   portRange{first: 1, last: math.MaxUint16},
+		},
+	}
+
+	type transportTypeTest struct {
+		name                 string
+		proto                tcpip.TransportProtocolNumber
+		buf                  func(tcpip.Address, uint16) buffer.View
+		checkNATed           func(*testing.T, buffer.View, uint16, bool, portRange)
+		srcPortOrIdentRanges []srcPortOrIdentRangeTest
+	}
+
+	compareSrcPortOrIdent := func(t *testing.T, gotPort uint16, originalSrcPort uint16, firstPacket bool, expectedRange portRange) {
 		t.Helper()
 
 		if firstPacket {
 			if gotPort != originalSrcPort {
-				t.Errorf("got port = %d, want = %d", gotPort, originalSrcPort)
+				t.Errorf("got port/ident = %d, want = %d", gotPort, originalSrcPort)
 			}
 			return
 		}
 
 		if gotPort < expectedRange.first || gotPort > expectedRange.last {
-			t.Errorf("got port = %d, want in range [%d, %d]", gotPort, expectedRange.first, expectedRange.last)
+			t.Errorf("got port/ident = %d, want in range [%d, %d]", gotPort, expectedRange.first, expectedRange.last)
 		}
 	}
 
@@ -2351,9 +2433,10 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 						)
 
 						if !t.Failed() {
-							compareSrcPort(t, header.UDP(header.IPv4(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
+							compareSrcPortOrIdent(t, header.UDP(header.IPv4(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
 						}
 					},
+					srcPortOrIdentRanges: srcPortRanges,
 				},
 				{
 					name:  "TCP",
@@ -2371,9 +2454,32 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 						)
 
 						if !t.Failed() {
-							compareSrcPort(t, header.TCP(header.IPv4(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
+							compareSrcPortOrIdent(t, header.TCP(header.IPv4(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
 						}
 					},
+					srcPortOrIdentRanges: srcPortRanges,
+				},
+				{
+					name:  "ICMP Echo",
+					proto: header.ICMPv4ProtocolNumber,
+					buf: func(srcAddr tcpip.Address, srcPort uint16) buffer.View {
+						return icmpv4Packet(srcAddr, utils.Host1IPv4Addr.AddressWithPrefix.Address, srcPort)
+					},
+					checkNATed: func(t *testing.T, v buffer.View, originalIdent uint16, firstPacket bool, expectedRange portRange) {
+						checker.IPv4(t, v,
+							checker.SrcAddr(utils.RouterNIC1IPv4Addr.AddressWithPrefix.Address),
+							checker.DstAddr(utils.Host1IPv4Addr.AddressWithPrefix.Address),
+							checker.ICMPv4(
+								checker.ICMPv4Type(header.ICMPv4Echo),
+								checker.ICMPv4Checksum(),
+							),
+						)
+
+						if !t.Failed() {
+							compareSrcPortOrIdent(t, header.ICMPv4(header.IPv4(v).Payload()).Ident(), originalIdent, firstPacket, expectedRange)
+						}
+					},
+					srcPortOrIdentRanges: identRanges,
 				},
 			},
 		},
@@ -2403,9 +2509,10 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 						)
 
 						if !t.Failed() {
-							compareSrcPort(t, header.UDP(header.IPv6(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
+							compareSrcPortOrIdent(t, header.UDP(header.IPv6(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
 						}
 					},
+					srcPortOrIdentRanges: srcPortRanges,
 				},
 				{
 					name:  "TCP",
@@ -2423,9 +2530,31 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 						)
 
 						if !t.Failed() {
-							compareSrcPort(t, header.TCP(header.IPv6(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
+							compareSrcPortOrIdent(t, header.TCP(header.IPv6(v).Payload()).SourcePort(), originalSrcPort, firstPacket, expectedRange)
 						}
 					},
+					srcPortOrIdentRanges: srcPortRanges,
+				},
+				{
+					name:  "ICMP Echo",
+					proto: header.ICMPv6ProtocolNumber,
+					buf: func(srcAddr tcpip.Address, ident uint16) buffer.View {
+						return icmpv6Packet(srcAddr, utils.Host1IPv6Addr.AddressWithPrefix.Address, ident)
+					},
+					checkNATed: func(t *testing.T, v buffer.View, originalIdent uint16, firstPacket bool, expectedRange portRange) {
+						checker.IPv6(t, v,
+							checker.SrcAddr(utils.RouterNIC1IPv6Addr.AddressWithPrefix.Address),
+							checker.DstAddr(utils.Host1IPv6Addr.AddressWithPrefix.Address),
+							checker.ICMPv6(
+								checker.ICMPv6Type(header.ICMPv6EchoRequest),
+							),
+						)
+
+						if !t.Failed() {
+							compareSrcPortOrIdent(t, header.ICMPv6(header.IPv6(v).Payload()).Ident(), originalIdent, firstPacket, expectedRange)
+						}
+					},
+					srcPortOrIdentRanges: identRanges,
 				},
 			},
 		},
@@ -2449,38 +2578,16 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 		},
 	}
 
-	srcPortRanges := []struct {
-		name          string
-		originalRange portRange
-		targetRange   portRange
-	}{
-		{
-			name:          "Less than 512",
-			originalRange: portRange{first: 1, last: 511},
-			targetRange:   portRange{first: 1, last: 511},
-		},
-		{
-			name:          "Greater than or equal to 512 but less than 1024",
-			originalRange: portRange{first: 512, last: 1023},
-			targetRange:   portRange{first: 1, last: 1023},
-		},
-		{
-			name:          "Greater than or equal to 1024",
-			originalRange: portRange{first: 1024, last: math.MaxUint16},
-			targetRange:   portRange{first: 1024, last: math.MaxUint16},
-		},
-	}
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			for _, transportType := range test.transportTypes {
 				t.Run(transportType.name, func(t *testing.T) {
 					for _, natType := range natTypes {
 						t.Run(natType.name, func(t *testing.T) {
-							for _, srcPortRange := range srcPortRanges {
-								t.Run(srcPortRange.name, func(t *testing.T) {
-									for _, srcPort := range [2]uint16{srcPortRange.originalRange.first, srcPortRange.originalRange.last} {
-										t.Run(fmt.Sprintf("OriginalSrcPort=%d", srcPort), func(t *testing.T) {
+							for _, srcPortOrIdentRange := range transportType.srcPortOrIdentRanges {
+								t.Run(srcPortOrIdentRange.name, func(t *testing.T) {
+									for _, srcPortOrIdent := range [2]uint16{srcPortOrIdentRange.originalRange.first, srcPortOrIdentRange.originalRange.last} {
+										t.Run(fmt.Sprintf("OriginalSrcPortOrIdent=%d", srcPortOrIdent), func(t *testing.T) {
 											s := stack.New(stack.Options{
 												NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 												TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol, tcp.NewProtocol},
@@ -2544,7 +2651,7 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 											for i, srcAddr := range test.srcAddrs {
 												t.Run(fmt.Sprintf("Packet#%d", i), func(t *testing.T) {
 													ep2.InjectInbound(test.netProto, stack.NewPacketBuffer(stack.PacketBufferOptions{
-														Data: transportType.buf(srcAddr, srcPort).ToVectorisedView(),
+														Data: transportType.buf(srcAddr, srcPortOrIdent).ToVectorisedView(),
 													}))
 
 													pkt, ok := ep1.Read()
@@ -2552,7 +2659,7 @@ func TestSNATHandlePortConflicts(t *testing.T) {
 														t.Fatal("expected to read a packet on ep1")
 													}
 													pktView := stack.PayloadSince(pkt.Pkt.NetworkHeader())
-													transportType.checkNATed(t, pktView, srcPort, i == 0, srcPortRange.targetRange)
+													transportType.checkNATed(t, pktView, srcPortOrIdent, i == 0, srcPortOrIdentRange.targetRange)
 												})
 											}
 										})
