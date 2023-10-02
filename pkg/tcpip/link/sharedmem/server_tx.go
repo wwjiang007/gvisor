@@ -18,14 +18,14 @@
 package sharedmem
 
 import (
-	"sync/atomic"
-
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/eventfd"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/pipe"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // serverTx represents the server end of the sharedmem queue and is used to send
@@ -50,7 +50,7 @@ type serverTx struct {
 
 	// sharedEventFDState is the memory region in sharedData used to enable/disable
 	// notifications on eventFD.
-	sharedEventFDState *uint32
+	sharedEventFDState *atomicbitops.Uint32
 }
 
 // init initializes all tstate needed by the serverTx queue based on the
@@ -113,57 +113,60 @@ func (s *serverTx) cleanup() {
 	s.eventFD.Close()
 }
 
+// acquireBuffers acquires enough buffers to hold all the data in views or
+// returns nil if not enough buffers are currently available.
+func (s *serverTx) acquireBuffers(pktBuffer buffer.Buffer, buffers []queue.RxBuffer) (acquiredBuffers []queue.RxBuffer) {
+	acquiredBuffers = buffers[:0]
+	wantBytes := int(pktBuffer.Size())
+	for wantBytes > 0 {
+		var b []byte
+		if b = s.fillPipe.Pull(); b == nil {
+			s.fillPipe.Abort()
+			return nil
+		}
+		rxBuffer := queue.DecodeRxBufferHeader(b)
+		acquiredBuffers = append(acquiredBuffers, rxBuffer)
+		wantBytes -= int(rxBuffer.Size)
+	}
+	return acquiredBuffers
+}
+
 // fillPacket copies the data in the provided views into buffers pulled from the
 // fillPipe and returns a slice of RxBuffers that contain the copied data as
 // well as the total number of bytes copied.
 //
 // To avoid allocations the filledBuffers are appended to the buffers slice
-// which will be grown as required.
-func (s *serverTx) fillPacket(views []buffer.View, buffers []queue.RxBuffer) (filledBuffers []queue.RxBuffer, totalCopied uint32) {
-	filledBuffers = buffers[:0]
-	// fillBuffer copies as much of the views as possible into the provided buffer
-	// and returns any left over views (if any).
-	fillBuffer := func(buffer *queue.RxBuffer, views []buffer.View) (left []buffer.View) {
-		if len(views) == 0 {
-			return nil
-		}
-		availBytes := buffer.Size
-		copied := uint64(0)
-		for availBytes > 0 && len(views) > 0 {
-			n := copy(s.data[buffer.Offset+copied:][:uint64(buffer.Size)-copied], views[0])
-			views[0].TrimFront(n)
-			if !views[0].IsEmpty() {
-				break
-			}
-			views = views[1:]
-			copied += uint64(n)
-			availBytes -= uint32(n)
-		}
-		buffer.Size = uint32(copied)
-		return views
+// which will be grown as required. This method takes ownership of pktBuffer.
+func (s *serverTx) fillPacket(pktBuffer buffer.Buffer, buffers []queue.RxBuffer) (filledBuffers []queue.RxBuffer, totalCopied uint32) {
+	bufs := s.acquireBuffers(pktBuffer, buffers)
+	if bufs == nil {
+		pktBuffer.Release()
+		return nil, 0
 	}
+	br := pktBuffer.AsBufferReader()
+	defer br.Close()
 
-	for len(views) > 0 {
-		var b []byte
-		// Spin till we get a free buffer reposted by the peer.
-		for {
-			if b = s.fillPipe.Pull(); b != nil {
-				break
-			}
-		}
-		rxBuffer := queue.DecodeRxBufferHeader(b)
+	for i := 0; br.Len() > 0 && i < len(bufs); i++ {
+		buf := bufs[i]
+		copied, err := br.Read(s.data[buf.Offset:][:buf.Size])
+		buf.Size = uint32(copied)
 		// Copy the packet into the posted buffer.
-		views = fillBuffer(&rxBuffer, views)
-		totalCopied += rxBuffer.Size
-		filledBuffers = append(filledBuffers, rxBuffer)
+		totalCopied += bufs[i].Size
+		if err != nil {
+			return bufs, totalCopied
+		}
 	}
-
-	return filledBuffers, totalCopied
+	return bufs, totalCopied
 }
 
-func (s *serverTx) transmit(views []buffer.View) bool {
+func (s *serverTx) transmit(pkt stack.PacketBufferPtr) bool {
 	buffers := make([]queue.RxBuffer, 8)
-	buffers, totalCopied := s.fillPacket(views, buffers)
+	buffers, totalCopied := s.fillPacket(pkt.ToBuffer(), buffers)
+	if totalCopied == 0 {
+		// drop the packet as not enough buffers were probably available
+		// to send.
+		return false
+	}
 	b := s.completionPipe.Push(queue.RxCompletionSize(len(buffers)))
 	if b == nil {
 		return false
@@ -179,7 +182,7 @@ func (s *serverTx) transmit(views []buffer.View) bool {
 
 func (s *serverTx) notificationsEnabled() bool {
 	// notifications are considered to be enabled unless explicitly disabled.
-	return atomic.LoadUint32(s.sharedEventFDState) != queue.EventFDDisabled
+	return s.sharedEventFDState.Load() != queue.EventFDDisabled
 }
 
 func (s *serverTx) notify() {

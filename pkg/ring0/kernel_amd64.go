@@ -20,8 +20,8 @@ package ring0
 import (
 	"encoding/binary"
 	"reflect"
-	"sync"
 
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
@@ -32,8 +32,6 @@ func HaltAndWriteFSBase(regs *arch.Registers)
 
 // init initializes architecture-specific state.
 func (k *Kernel) init(maxCPUs int) {
-	initSentryXCR0()
-
 	entrySize := reflect.TypeOf(kernelEntry{}).Size()
 	var (
 		entries []kernelEntry
@@ -197,6 +195,9 @@ func (c *CPU) CR4() uint64 {
 	if hasSMEP {
 		cr4 |= _CR4_SMEP
 	}
+	if hasSMAP {
+		cr4 |= _CR4_SMAP
+	}
 	if hasFSGSBASE {
 		cr4 |= _CR4_FSGSBASE
 	}
@@ -214,7 +215,7 @@ func (c *CPU) EFER() uint64 {
 //
 //go:nosplit
 func IsCanonical(addr uint64) bool {
-	return addr <= 0x00007fffffffffff || addr > 0xffff800000000000
+	return addr <= 0x00007fffffffffff || addr >= 0xffff800000000000
 }
 
 // SwitchToUser performs either a sysret or an iret.
@@ -266,28 +267,17 @@ func doSwitchToUser(
 	userCR3 uint64, // +24(FP)
 	needIRET uint64) Vector // +32(FP), +40(FP)
 
-var (
-	sentryXCR0     uintptr
-	sentryXCR0Once sync.Once
-)
-
-// initSentryXCR0 saves a value of XCR0 in the host mode. It is used to
-// initialize XCR0 of guest vCPU-s.
-func initSentryXCR0() {
-	sentryXCR0Once.Do(func() { sentryXCR0 = xgetbv(0) })
-}
-
 // startGo is the CPU entrypoint.
 //
 // This is called from the start asm stub (see entry_amd64.go); on return the
 // registers in c.registers will be restored (not segments).
 //
 // Note that any code written in Go should adhere to Go expected environment:
-// * Initialized floating point state (required for optimizations using
-//   floating point instructions).
-// * Go TLS in FS_BASE (this is required by splittable functions, calls into
-//   the runtime, calls to assembly functions (Go 1.17+ ABI wrappers access
-//   TLS)).
+//   - Initialized floating point state (required for optimizations using
+//     floating point instructions).
+//   - Go TLS in FS_BASE (this is required by splittable functions, calls into
+//     the runtime, calls to assembly functions (Go 1.17+ ABI wrappers access
+//     TLS)).
 //
 //go:nosplit
 func startGo(c *CPU) {
@@ -303,7 +293,12 @@ func startGo(c *CPU) {
 	fninit()
 	// Need to sync XCR0 with the host, because xsave and xrstor can be
 	// called from different contexts.
-	xsetbv(0, sentryXCR0)
+	if hasXSAVE {
+		// Exclude MPX bits. MPX has been deprecated and we have seen
+		// cases when it isn't supported in VM.
+		xcr0 := localXCR0 &^ (cpuid.XSAVEFeatureBNDCSR | cpuid.XSAVEFeatureBNDREGS)
+		xsetbv(0, xcr0)
+	}
 
 	// Set the syscall target.
 	wrmsr(_MSR_LSTAR, kernelFunc(addrOfSysenter()))
@@ -342,22 +337,4 @@ func SetCPUIDFaulting(on bool) bool {
 //go:nosplit
 func ReadCR2() uintptr {
 	return readCR2()
-}
-
-// kernelMXCSR is the value of the mxcsr register in the Sentry.
-//
-// The MXCSR control configuration is initialized once and never changed. Look
-// at src/cmd/compile/abi-internal.md in the golang sources for more details.
-var kernelMXCSR uint32
-
-// RestoreKernelFPState restores the Sentry floating point state.
-//
-//go:nosplit
-func RestoreKernelFPState() {
-	// Restore the MXCSR control configuration.
-	ldmxcsr(&kernelMXCSR)
-}
-
-func init() {
-	stmxcsr(&kernelMXCSR)
 }

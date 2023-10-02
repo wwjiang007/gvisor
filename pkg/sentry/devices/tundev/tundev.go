@@ -16,7 +16,11 @@
 package tundev
 
 import (
+	"io"
+
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -65,7 +69,7 @@ type tunFD struct {
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
-func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	request := args[1].Uint()
 	data := args[2].Pointer()
 
@@ -124,8 +128,11 @@ func (fd *tunFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.Read
 	if err != nil {
 		return 0, err
 	}
-	n, err := dst.CopyOut(ctx, data)
-	if n > 0 && n < len(data) {
+	defer data.Release()
+
+	size := data.Size()
+	n, err := io.CopyN(dst.Writer(ctx), data, dst.NumBytes())
+	if n > 0 && n < int64(size) {
 		// Not an error for partial copying. Packet truncated.
 		err = nil
 	}
@@ -139,8 +146,19 @@ func (fd *tunFD) PWrite(ctx context.Context, src usermem.IOSequence, offset int6
 
 // Write implements vfs.FileDescriptionImpl.Write.
 func (fd *tunFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
-	data := make([]byte, src.NumBytes())
-	if _, err := src.CopyIn(ctx, data); err != nil {
+	if src.NumBytes() == 0 {
+		return 0, unix.EINVAL
+	}
+	mtu, err := fd.device.MTU()
+	if err != nil {
+		return 0, err
+	}
+	if int64(mtu) < src.NumBytes() {
+		return 0, unix.EMSGSIZE
+	}
+	data := buffer.NewView(int(src.NumBytes()))
+	defer data.Release()
+	if _, err := io.CopyN(data, src.Reader(ctx), src.NumBytes()); err != nil {
 		return 0, err
 	}
 	return fd.device.Write(data)
@@ -152,13 +170,19 @@ func (fd *tunFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements watier.Waitable.EventRegister.
-func (fd *tunFD) EventRegister(e *waiter.Entry) {
+func (fd *tunFD) EventRegister(e *waiter.Entry) error {
 	fd.device.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements watier.Waitable.EventUnregister.
 func (fd *tunFD) EventUnregister(e *waiter.Entry) {
 	fd.device.EventUnregister(e)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (fd *tunFD) Epollable() bool {
+	return true
 }
 
 // IsNetTunSupported returns whether /dev/net/tun device is supported for s.

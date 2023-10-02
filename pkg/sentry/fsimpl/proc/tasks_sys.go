@@ -45,14 +45,15 @@ const (
 func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *kernel.Kernel) kernfs.Inode {
 	return fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 		"kernel": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
-			"hostname": fs.newInode(ctx, root, 0444, &hostnameData{}),
-			"sem":      fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\t%d\t%d\t%d\n", linux.SEMMSL, linux.SEMMNS, linux.SEMOPM, linux.SEMMNI))),
-			"shmall":   fs.newInode(ctx, root, 0444, ipcData(linux.SHMALL)),
-			"shmmax":   fs.newInode(ctx, root, 0444, ipcData(linux.SHMMAX)),
-			"shmmni":   fs.newInode(ctx, root, 0444, ipcData(linux.SHMMNI)),
-			"msgmni":   fs.newInode(ctx, root, 0444, ipcData(linux.MSGMNI)),
-			"msgmax":   fs.newInode(ctx, root, 0444, ipcData(linux.MSGMAX)),
-			"msgmnb":   fs.newInode(ctx, root, 0444, ipcData(linux.MSGMNB)),
+			"cap_last_cap": fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\n", linux.CAP_LAST_CAP))),
+			"hostname":     fs.newInode(ctx, root, 0444, &hostnameData{}),
+			"sem":          fs.newInode(ctx, root, 0444, newStaticFile(fmt.Sprintf("%d\t%d\t%d\t%d\n", linux.SEMMSL, linux.SEMMNS, linux.SEMOPM, linux.SEMMNI))),
+			"shmall":       fs.newInode(ctx, root, 0444, ipcData(linux.SHMALL)),
+			"shmmax":       fs.newInode(ctx, root, 0444, ipcData(linux.SHMMAX)),
+			"shmmni":       fs.newInode(ctx, root, 0444, ipcData(linux.SHMMNI)),
+			"msgmni":       fs.newInode(ctx, root, 0444, ipcData(linux.MSGMNI)),
+			"msgmax":       fs.newInode(ctx, root, 0444, ipcData(linux.MSGMAX)),
+			"msgmnb":       fs.newInode(ctx, root, 0444, ipcData(linux.MSGMNB)),
 			"yama": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 				"ptrace_scope": fs.newYAMAPtraceScopeFile(ctx, k, root),
 			}),
@@ -169,6 +170,7 @@ var _ dynamicInode = (*hostnameData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*hostnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	utsns := kernel.UTSNamespaceFromContext(ctx)
+	defer utsns.DecRef(ctx)
 	buf.WriteString(utsns.HostName())
 	buf.WriteString("\n")
 	return nil
@@ -209,7 +211,7 @@ func (d *tcpSackData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (d *tcpSackData) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (d *tcpSackData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		// No need to handle partial writes thus far.
 		return 0, linuxerr.EINVAL
@@ -257,7 +259,7 @@ func (d *tcpRecoveryData) Generate(ctx context.Context, buf *bytes.Buffer) error
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (d *tcpRecoveryData) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (d *tcpRecoveryData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		// No need to handle partial writes thus far.
 		return 0, linuxerr.EINVAL
@@ -311,7 +313,7 @@ func (d *tcpMemData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (d *tcpMemData) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (d *tcpMemData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		// No need to handle partial writes thus far.
 		return 0, linuxerr.EINVAL
@@ -396,7 +398,7 @@ func (ipf *ipForwarding) Generate(ctx context.Context, buf *bytes.Buffer) error 
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (ipf *ipForwarding) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (ipf *ipForwarding) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		// No need to handle partial writes thus far.
 		return 0, linuxerr.EINVAL
@@ -449,7 +451,7 @@ func (pr *portRange) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (pr *portRange) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (pr *portRange) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		// No need to handle partial writes thus far.
 		return 0, linuxerr.EINVAL

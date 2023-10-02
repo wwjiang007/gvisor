@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.12
-// +build go1.12
+//go:build go1.18
+// +build go1.18
 
 // //go:linkname directives type-checked by checklinkname. Any other
 // non-linkname assumptions outside the Go 1 compatibility guarantee should
@@ -24,11 +24,14 @@ package kvm
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 )
 
 //go:linkname entersyscall runtime.entersyscall
@@ -53,10 +56,11 @@ func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr, f
 	}
 
 	// Set the region.
-	_, _, errno := unix.RawSyscall(
+	// Note: syscall.RawSyscall is used to fit the nosplit stack limit.
+	_, _, errno := syscall.RawSyscall(
 		unix.SYS_IOCTL,
 		uintptr(m.fd),
-		_KVM_SET_USER_MEMORY_REGION,
+		KVM_SET_USER_MEMORY_REGION,
 		uintptr(unsafe.Pointer(&userRegion)))
 	return errno
 }
@@ -164,12 +168,32 @@ func (c *vCPU) setSignalMask() error {
 	if _, _, errno := unix.RawSyscall(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
-		_KVM_SET_SIGNAL_MASK,
+		KVM_SET_SIGNAL_MASK,
 		uintptr(unsafe.Pointer(&data))); errno != 0 {
 		return fmt.Errorf("error setting signal mask: %v", errno)
 	}
 
 	return nil
+}
+
+// seccompMmapHandlerCnt is a number of currently running seccompMmapHandler
+// instances.
+var seccompMmapHandlerCnt atomicbitops.Int64
+
+// seccompMmapSync waits for all currently runnuing seccompMmapHandler
+// instances.
+//
+// The standard locking primitives can't be used in this case since
+// seccompMmapHandler is executed in a signal handler context.
+//
+// It can be implemented by using FUTEX calls, but it will require to call
+// FUTEX_WAKE from seccompMmapHandler. Consider machine.Destroy is called only
+// once, and the probability is racing with seccompMmapHandler is very low the
+// spinlock-like way looks more reasonable.
+func seccompMmapSync() {
+	for seccompMmapHandlerCnt.Load() != 0 {
+		runtime.Gosched()
+	}
 }
 
 // seccompMmapHandler is a signal handler for runtime mmap system calls
@@ -180,12 +204,15 @@ func (c *vCPU) setSignalMask() error {
 //
 //go:nosplit
 func seccompMmapHandler(context unsafe.Pointer) {
+	mmapCallCounter.Increment()
+
 	addr, length, errno := seccompMmapSyscall(context)
 	if errno != 0 {
 		return
 	}
 
-	for i := uint32(0); i < atomic.LoadUint32(&machinePoolLen); i++ {
+	seccompMmapHandlerCnt.Add(1)
+	for i := uint32(0); i < machinePoolLen.Load(); i++ {
 		m := machinePool[i].Load()
 		if m == nil {
 			continue
@@ -209,8 +236,29 @@ func seccompMmapHandler(context unsafe.Pointer) {
 			}
 
 			// Ensure the physical range is mapped.
-			m.mapPhysical(physical, length, physicalRegions, _KVM_MEM_FLAGS_NONE)
+			m.mapPhysical(physical, length, physicalRegions)
 			virtual += length
 		}
+	}
+	seccompMmapHandlerCnt.Add(-1)
+}
+
+// disableAsyncPreemption disables asynchronous preemption of go-routines.
+func disableAsyncPreemption() {
+	set := linux.MakeSignalSet(linux.SIGURG)
+	_, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, linux.SIG_BLOCK,
+		uintptr(unsafe.Pointer(&set)), 0, linux.SignalSetSize, 0, 0)
+	if errno != 0 {
+		panic(fmt.Sprintf("sigprocmask failed: %d", errno))
+	}
+}
+
+// enableAsyncPreemption enables asynchronous preemption of go-routines.
+func enableAsyncPreemption() {
+	set := linux.MakeSignalSet(linux.SIGURG)
+	_, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGPROCMASK, linux.SIG_UNBLOCK,
+		uintptr(unsafe.Pointer(&set)), 0, linux.SignalSetSize, 0, 0)
+	if errno != 0 {
+		panic(fmt.Sprintf("sigprocmask failed: %d", errno))
 	}
 }

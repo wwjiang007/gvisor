@@ -50,17 +50,34 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 	return header.UnspecifiedEthernetAddress
 }
 
+// MTU implements stack.LinkEndpoint.
+func (e *Endpoint) MTU() uint32 {
+	if mtu := e.Endpoint.MTU(); mtu > header.EthernetMinimumSize {
+		return mtu - header.EthernetMinimumSize
+	}
+	return 0
+}
+
 // DeliverNetworkPacket implements stack.NetworkDispatcher.
-func (e *Endpoint) DeliverNetworkPacket(_, _ tcpip.LinkAddress, _ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	hdr, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
-	if !ok {
+func (e *Endpoint) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+	if !e.ParseHeader(pkt) {
 		return
+	}
+	eth := header.Ethernet(pkt.LinkHeader().Slice())
+	dst := eth.DestinationAddress()
+	if dst == header.EthernetBroadcastAddress {
+		pkt.PktType = tcpip.PacketBroadcast
+	} else if header.IsMulticastEthernetAddress(dst) {
+		pkt.PktType = tcpip.PacketMulticast
+	} else if dst == e.LinkAddress() {
+		pkt.PktType = tcpip.PacketHost
+	} else {
+		pkt.PktType = tcpip.PacketOtherHost
 	}
 
 	// Note, there is no need to check the destination link address here since
 	// the ethernet hardware filters frames based on their destination addresses.
-	eth := header.Ethernet(hdr)
-	e.Endpoint.DeliverNetworkPacket(eth.SourceAddress() /* remote */, eth.DestinationAddress() /* local */, eth.Type() /* protocol */, pkt)
+	e.Endpoint.DeliverNetworkPacket(eth.Type() /* protocol */, pkt)
 }
 
 // Capabilities implements stack.LinkEndpoint.
@@ -70,23 +87,6 @@ func (e *Endpoint) Capabilities() stack.LinkEndpointCapabilities {
 		c |= stack.CapabilityResolutionRequired
 	}
 	return c
-}
-
-// WritePacket implements stack.LinkEndpoint.
-func (e *Endpoint) WritePacket(r stack.RouteInfo, proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	e.AddHeader(e.LinkAddress(), r.RemoteLinkAddress, proto, pkt)
-	return e.Endpoint.WritePacket(r, proto, pkt)
-}
-
-// WritePackets implements stack.LinkEndpoint.
-func (e *Endpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, proto tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	linkAddr := e.LinkAddress()
-
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		e.AddHeader(linkAddr, r.RemoteLinkAddress, proto, pkt)
-	}
-
-	return e.Endpoint.WritePackets(r, pkts, proto)
 }
 
 // MaxHeaderLength implements stack.LinkEndpoint.
@@ -103,17 +103,18 @@ func (e *Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.
-func (*Endpoint) AddHeader(local, remote tcpip.LinkAddress, proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (*Endpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
 	fields := header.EthernetFields{
-		SrcAddr: local,
-		DstAddr: remote,
-		Type:    proto,
+		SrcAddr: pkt.EgressRoute.LocalLinkAddress,
+		DstAddr: pkt.EgressRoute.RemoteLinkAddress,
+		Type:    pkt.NetworkProtocolNumber,
 	}
 	eth.Encode(&fields)
 }
 
-// WriteRawPacket implements stack.LinkEndpoint.
-func (e *Endpoint) WriteRawPacket(pkt *stack.PacketBuffer) tcpip.Error {
-	return e.Endpoint.WriteRawPacket(pkt)
+// ParseHeader implements stack.LinkEndpoint.
+func (*Endpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
+	_, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
+	return ok
 }

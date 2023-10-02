@@ -16,9 +16,14 @@
 package bitmap
 
 import (
+	"fmt"
 	"math"
 	"math/bits"
 )
+
+// MaxBitEntryLimit defines the upper limit on how many bit entries are supported by this Bitmap
+// implementation.
+const MaxBitEntryLimit uint32 = math.MaxInt32
 
 // Bitmap implements an efficient bitmap.
 //
@@ -45,6 +50,22 @@ func (b *Bitmap) IsEmpty() bool {
 	return b.numOnes == 0
 }
 
+// Size returns the total number of bits in the bitmap.
+func (b *Bitmap) Size() int {
+	return len(b.bitBlock) * 64
+}
+
+// Grow grows the bitmap by at least toGrow bits.
+func (b *Bitmap) Grow(toGrow uint32) error {
+	newbitBlockSize := uint32(len(b.bitBlock)) + ((toGrow + 63) / 64)
+	if newbitBlockSize > MaxBitEntryLimit/8 {
+		return fmt.Errorf("requested bitmap size %d too large", newbitBlockSize*64)
+	}
+	bits := make([]uint64, (toGrow+63)/64)
+	b.bitBlock = append(b.bitBlock, bits...)
+	return nil
+}
+
 // Minimum return the smallest value in the Bitmap.
 func (b *Bitmap) Minimum() uint32 {
 	for i := 0; i < len(b.bitBlock); i++ {
@@ -53,21 +74,21 @@ func (b *Bitmap) Minimum() uint32 {
 			return uint32(r + i*64)
 		}
 	}
-	return math.MaxInt32
+	return MaxBitEntryLimit
 }
 
 // FirstZero returns the first unset bit from the range [start, ).
-func (b *Bitmap) FirstZero(start uint32) uint32 {
+func (b *Bitmap) FirstZero(start uint32) (bit uint32, err error) {
 	i, nbit := int(start/64), start%64
 	n := len(b.bitBlock)
 	if i >= n {
-		return math.MaxInt32
+		return MaxBitEntryLimit, fmt.Errorf("given start of range exceeds bitmap size")
 	}
 	w := b.bitBlock[i] | ((1 << nbit) - 1)
 	for {
 		if w != ^uint64(0) {
 			r := bits.TrailingZeros64(^w)
-			return uint32(r + i*64)
+			return uint32(r + i*64), nil
 		}
 		i++
 		if i == n {
@@ -75,7 +96,29 @@ func (b *Bitmap) FirstZero(start uint32) uint32 {
 		}
 		w = b.bitBlock[i]
 	}
-	return math.MaxInt32
+	return MaxBitEntryLimit, fmt.Errorf("bitmap has no unset bits")
+}
+
+// FirstOne returns the first set bit from the range [start, )
+func (b *Bitmap) FirstOne(start uint32) (bit uint32, err error) {
+	i, nbit := int(start/64), start%64
+	n := len(b.bitBlock)
+	if i >= n {
+		return MaxBitEntryLimit, fmt.Errorf("given start of range exceeds bitmap size")
+	}
+	w := b.bitBlock[i] & (math.MaxUint64 << nbit)
+	for {
+		if w != uint64(0) {
+			r := bits.TrailingZeros64(w)
+			return uint32(r + i*64), nil
+		}
+		i++
+		if i == n {
+			break
+		}
+		w = b.bitBlock[i]
+	}
+	return MaxBitEntryLimit, fmt.Errorf("bitmap has no set bits")
 }
 
 // Maximum return the largest value in the Bitmap.
@@ -204,6 +247,38 @@ func (b *Bitmap) FlipRange(begin, end uint32) {
 		b.flipRange(begin, end)
 		newRangeOnes := b.countOnesForBlocks(begin, end)
 		b.numOnes += uint32(newRangeOnes - oldRangeOnes)
+	}
+}
+
+// ForEach calls `f` for each set bit in the range [start, end).
+//
+// If f returns false, ForEach stops the iteration.
+func (b *Bitmap) ForEach(start, end uint32, f func(idx uint32) bool) {
+	blockEnd := (end + 63) / 64
+	if blockEnd > uint32(len(b.bitBlock)) {
+		blockEnd = uint32(len(b.bitBlock))
+	}
+	// base is the start number of a bitBlock
+	base := start / 64 * 64
+	blockMask := ^((uint64(1) << (start % 64)) - 1)
+	for i := start / 64; i < blockEnd; i++ {
+		if i == end/64 {
+			blockMask &= (uint64(1) << (end % 64)) - 1
+		}
+		bitBlock := b.bitBlock[i] & blockMask
+		blockMask = ^uint64(0)
+		// Iterate through all the numbers held by this bit block.
+		for bitBlock != 0 {
+			// Extract the lowest set 1 bit.
+			j := bitBlock & -bitBlock
+			// Interpret the bit as the in32 number it represents and add it to result.
+			idx := base + uint32(bits.OnesCount64(j-1))
+			if !f(idx) {
+				return
+			}
+			bitBlock ^= j
+		}
+		base += 64
 	}
 }
 

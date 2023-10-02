@@ -18,8 +18,8 @@ import (
 	"math"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/eventfd"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
 )
 
@@ -43,7 +43,7 @@ type tx struct {
 //
 // The caller always retains ownership of all file descriptors passed in. The
 // queue implementation will duplicate any that it may need in the future.
-func (t *tx) init(mtu uint32, c *QueueConfig) error {
+func (t *tx) init(bufferSize uint32, c *QueueConfig) error {
 	// Map in all buffers.
 	txPipe, err := getBuffer(c.TxPipeFD)
 	if err != nil {
@@ -73,7 +73,7 @@ func (t *tx) init(mtu uint32, c *QueueConfig) error {
 	// Initialize state based on buffers.
 	t.q.Init(txPipe, rxPipe, sharedDataPointer(sharedData))
 	t.ids.init()
-	t.bufs.init(0, len(data), int(mtu))
+	t.bufs.init(0, len(data), int(bufferSize))
 	t.data = data
 	t.eventFD = c.EventFD
 	t.sharedDataFD = c.SharedDataFD
@@ -93,7 +93,7 @@ func (t *tx) cleanup() {
 
 // transmit sends a packet made of bufs. Returns a boolean that specifies
 // whether the packet was successfully transmitted.
-func (t *tx) transmit(bufs ...buffer.View) bool {
+func (t *tx) transmit(transmitBuf buffer.Buffer) bool {
 	// Pull completions from the tx queue and add their buffers back to the
 	// pool so that we can reuse them.
 	for {
@@ -108,10 +108,7 @@ func (t *tx) transmit(bufs ...buffer.View) bool {
 	}
 
 	bSize := t.bufs.entrySize
-	total := uint32(0)
-	for _, data := range bufs {
-		total += uint32(len(data))
-	}
+	total := uint32(transmitBuf.Size())
 	bufCount := (total + bSize - 1) / bSize
 
 	// Allocate enough buffers to hold all the data.
@@ -133,17 +130,17 @@ func (t *tx) transmit(bufs ...buffer.View) bool {
 	// Copy data into allocated buffers.
 	nBuf := buf
 	var dBuf []byte
-	for _, data := range bufs {
-		for len(data) > 0 {
+	transmitBuf.Apply(func(v *buffer.View) {
+		for v.Size() > 0 {
 			if len(dBuf) == 0 {
 				dBuf = t.data[nBuf.Offset:][:nBuf.Size]
 				nBuf = nBuf.Next
 			}
-			n := copy(dBuf, data)
-			data = data[n:]
+			n := copy(dBuf, v.AsSlice())
+			v.TrimFront(n)
 			dBuf = dBuf[n:]
 		}
-	}
+	})
 
 	// Get an id for this packet and send it out.
 	id := t.ids.add(buf)

@@ -65,9 +65,10 @@ func HighestVersionString() string {
 // predicate must be commented and should take the format:
 //
 // // VersionSupportsX returns true if version v supports X and must be checked when ...
-// func VersionSupportsX(v int32) bool {
-//	...
-// )
+//
+//	func VersionSupportsX(v int32) bool {
+//		...
+//	}
 func parseVersion(str string) (uint32, bool) {
 	// Special case the base version which lacks the ".Google.X" suffix.  This
 	// version always means version 0.
@@ -184,4 +185,10 @@ func versionSupportsTsetattrclunk(v uint32) bool {
 // the TmultiGetAttr message.
 func versionSupportsTmultiGetAttr(v uint32) bool {
 	return v >= 13
+}
+
+// versionSupportsBind returns true if version v supports the Tbind message.
+func versionSupportsBind(v uint32) bool {
+	// TODO(b/194709873): Bump version and gate with that.
+	return false
 }

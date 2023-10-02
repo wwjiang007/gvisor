@@ -15,50 +15,39 @@
 package cgroupfs
 
 import (
-	"bytes"
-	"fmt"
-
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // +stateify savable
 type jobController struct {
 	controllerCommon
-	id int64
+	controllerStateless
+	controllerNoResource
+
+	id atomicbitops.Int64
 }
 
 var _ controller = (*jobController)(nil)
 
 func newJobController(fs *filesystem) *jobController {
 	c := &jobController{}
-	c.controllerCommon.init(controllerJob, fs)
+	c.controllerCommon.init(kernel.CgroupControllerJob, fs)
 	return c
 }
 
-func (c *jobController) AddControlFiles(ctx context.Context, creds *auth.Credentials, _ *cgroupInode, contents map[string]kernfs.Inode) {
-	contents["job.id"] = c.fs.newControllerWritableFile(ctx, creds, &jobIDData{c: c})
-}
-
-// +stateify savable
-type jobIDData struct {
-	c *jobController
-}
-
-// Generate implements vfs.DynamicBytesSource.Generate.
-func (d *jobIDData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	fmt.Fprintf(buf, "%d\n", d.c.id)
-	return nil
-}
-
-// Write implements vfs.WritableDynamicBytesSource.Write.
-func (d *jobIDData) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
-	val, n, err := parseInt64FromString(ctx, src, offset)
-	if err != nil {
-		return n, err
+// Clone implements controller.Clone.
+func (c *jobController) Clone() controller {
+	new := &jobController{
+		id: atomicbitops.FromInt64(c.id.Load()),
 	}
-	d.c.id = val
-	return n, nil
+	new.controllerCommon.cloneFromParent(c)
+	return new
+}
+
+func (c *jobController) AddControlFiles(ctx context.Context, creds *auth.Credentials, _ *cgroupInode, contents map[string]kernfs.Inode) {
+	contents["job.id"] = c.fs.newStubControllerFile(ctx, creds, &c.id, true)
 }

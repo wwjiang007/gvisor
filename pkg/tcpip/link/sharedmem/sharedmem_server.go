@@ -18,11 +18,10 @@
 package sharedmem
 
 import (
-	"sync/atomic"
-
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -44,9 +43,8 @@ type serverEndpoint struct {
 	// rx is the receive queue.
 	rx serverRx
 
-	// stopRequested is to be accessed atomically only, and determines if the
-	// worker goroutines should stop.
-	stopRequested uint32
+	// stopRequested determines whether the worker goroutines should stop.
+	stopRequested atomicbitops.Uint32
 
 	// Wait group used to indicate that all workers have stopped.
 	completed sync.WaitGroup
@@ -62,6 +60,10 @@ type serverEndpoint struct {
 	// hdrSize is the size of the link layer header if any.
 	// hdrSize is immutable.
 	hdrSize uint32
+
+	// virtioNetHeaderRequired if true indicates that a virtio header is expected
+	// in all inbound/outbound packets.
+	virtioNetHeaderRequired bool
 
 	// onClosed is a function to be called when the FD's peer (if any) closes its
 	// end of the communication pipe.
@@ -120,7 +122,7 @@ func NewServerEndpoint(opts Options) (stack.LinkEndpoint, error) {
 func (e *serverEndpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that it wakes
 	// up in case it's sleeping.
-	atomic.StoreUint32(&e.stopRequested, 1)
+	e.stopRequested.Store(1)
 	e.rx.eventFD.Notify()
 
 	// Cleanup the queues inline if the worker hasn't started yet; we also know it
@@ -145,7 +147,7 @@ func (e *serverEndpoint) Wait() {
 // reads packets from the rx queue.
 func (e *serverEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.mu.Lock()
-	if !e.workerStarted && atomic.LoadUint32(&e.stopRequested) == 0 {
+	if !e.workerStarted && e.stopRequested.Load() == 0 {
 		e.workerStarted = true
 		e.completed.Add(1)
 		if e.peerFD >= 0 {
@@ -180,7 +182,7 @@ func (e *serverEndpoint) IsAttached() bool {
 // MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
 // during construction.
 func (e *serverEndpoint) MTU() uint32 {
-	return e.mtu - e.hdrSize
+	return e.mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
@@ -201,44 +203,47 @@ func (e *serverEndpoint) LinkAddress() tcpip.LinkAddress {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *serverEndpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (e *serverEndpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	// Add ethernet header if needed.
-	eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
-	ethHdr := &header.EthernetFields{
-		DstAddr: remote,
-		Type:    protocol,
+	if len(e.addr) == 0 {
+		return
 	}
 
-	// Preserve the src address if it's set in the route.
-	if local != "" {
-		ethHdr.SrcAddr = local
-	} else {
-		ethHdr.SrcAddr = e.addr
-	}
-	eth.Encode(ethHdr)
+	eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
+	eth.Encode(&header.EthernetFields{
+		SrcAddr: pkt.EgressRoute.LocalLinkAddress,
+		DstAddr: pkt.EgressRoute.RemoteLinkAddress,
+		Type:    pkt.NetworkProtocolNumber,
+	})
 }
 
-// WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket
-func (e *serverEndpoint) WriteRawPacket(pkt *stack.PacketBuffer) tcpip.Error {
-	views := pkt.Views()
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	ok := e.tx.transmit(views)
-	if !ok {
-		return &tcpip.ErrWouldBlock{}
+func (e *serverEndpoint) parseHeader(pkt stack.PacketBufferPtr) bool {
+	_, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
+	return ok
+}
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (e *serverEndpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
+	// Add ethernet header if needed.
+	if len(e.addr) == 0 {
+		return true
 	}
-	e.tx.notify()
-	return nil
+
+	return e.parseHeader(pkt)
+}
+
+func (e *serverEndpoint) AddVirtioNetHeader(pkt stack.PacketBufferPtr) {
+	virtio := header.VirtioNetHeader(pkt.VirtioNetHeader().Push(header.VirtioNetHeaderSize))
+	virtio.Encode(&header.VirtioNetHeaderFields{})
 }
 
 // +checklocks:e.mu
-func (e *serverEndpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	if e.addr != "" {
-		e.AddHeader(r.LocalLinkAddress, r.RemoteLinkAddress, protocol, pkt)
+func (e *serverEndpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) tcpip.Error {
+	if e.virtioNetHeaderRequired {
+		e.AddVirtioNetHeader(pkt)
 	}
 
-	views := pkt.Views()
-	ok := e.tx.transmit(views)
+	ok := e.tx.transmit(pkt)
 	if !ok {
 		return &tcpip.ErrWouldBlock{}
 	}
@@ -249,7 +254,7 @@ func (e *serverEndpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.Net
 // WritePacket writes outbound packets to the file descriptor. If it is not
 // currently writable, the packet is dropped.
 // WritePacket implements stack.LinkEndpoint.WritePacket.
-func (e *serverEndpoint) WritePacket(_ stack.RouteInfo, _ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
+func (e *serverEndpoint) WritePacket(_ stack.RouteInfo, _ tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) tcpip.Error {
 	// Transmit the packet.
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -261,12 +266,12 @@ func (e *serverEndpoint) WritePacket(_ stack.RouteInfo, _ tcpip.NetworkProtocolN
 }
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
-func (e *serverEndpoint) WritePackets(_ stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+func (e *serverEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	n := 0
 	var err tcpip.Error
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+	for _, pkt := range pkts.AsSlice() {
 		if err = e.writePacketLocked(pkt.EgressRoute, pkt.NetworkProtocolNumber, pkt); err != nil {
 			break
 		}
@@ -284,7 +289,7 @@ func (e *serverEndpoint) WritePackets(_ stack.RouteInfo, pkts stack.PacketBuffer
 // dispatchLoop reads packets from the rx queue in a loop and dispatches them
 // to the network stack.
 func (e *serverEndpoint) dispatchLoop(d stack.NetworkDispatcher) {
-	for atomic.LoadUint32(&e.stopRequested) == 0 {
+	for e.stopRequested.Load() == 0 {
 		b := e.rx.receive()
 		if b == nil {
 			e.rx.EnableNotification()
@@ -304,20 +309,22 @@ func (e *serverEndpoint) dispatchLoop(d stack.NetworkDispatcher) {
 			}
 		}
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Data: buffer.View(b).ToVectorisedView(),
+			Payload: buffer.MakeWithView(b),
 		})
-		var src, dst tcpip.LinkAddress
-		var proto tcpip.NetworkProtocolNumber
-		if e.addr != "" {
-			hdr, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
+		if e.virtioNetHeaderRequired {
+			_, ok := pkt.VirtioNetHeader().Consume(header.VirtioNetHeaderSize)
 			if !ok {
 				pkt.DecRef()
 				continue
 			}
-			eth := header.Ethernet(hdr)
-			src = eth.SourceAddress()
-			dst = eth.DestinationAddress()
-			proto = eth.Type()
+		}
+		var proto tcpip.NetworkProtocolNumber
+		if len(e.addr) != 0 {
+			if !e.parseHeader(pkt) {
+				pkt.DecRef()
+				continue
+			}
+			proto = header.Ethernet(pkt.LinkHeader().Slice()).Type()
 		} else {
 			// We don't get any indication of what the packet is, so try to guess
 			// if it's an IPv4 or IPv6 packet.
@@ -338,7 +345,7 @@ func (e *serverEndpoint) dispatchLoop(d stack.NetworkDispatcher) {
 			}
 		}
 		// Send packet up the stack.
-		d.DeliverNetworkPacket(src, dst, proto, pkt)
+		d.DeliverNetworkPacket(proto, pkt)
 		pkt.DecRef()
 	}
 

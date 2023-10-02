@@ -249,6 +249,8 @@ func (rf *regularFile) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(6, &rf.size)
 }
 
+func (rf *regularFile) afterLoad() {}
+
 // +checklocksignore
 func (rf *regularFile) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &rf.inode)
@@ -258,7 +260,6 @@ func (rf *regularFile) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(4, &rf.data)
 	stateSourceObject.Load(5, &rf.seals)
 	stateSourceObject.Load(6, &rf.size)
-	stateSourceObject.AfterLoad(rf.afterLoad)
 }
 
 func (fd *regularFileFD) StateTypeName() string {
@@ -373,6 +374,7 @@ func (fs *filesystem) StateTypeName() string {
 func (fs *filesystem) StateFields() []string {
 	return []string{
 		"vfsfs",
+		"privateMF",
 		"mfp",
 		"clock",
 		"devMinor",
@@ -380,6 +382,10 @@ func (fs *filesystem) StateFields() []string {
 		"usage",
 		"nextInoMinusOne",
 		"root",
+		"maxFilenameLen",
+		"maxSizeInPages",
+		"pagesUsed",
+		"allowXattrPrefix",
 	}
 }
 
@@ -389,27 +395,36 @@ func (fs *filesystem) beforeSave() {}
 func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	fs.beforeSave()
 	stateSinkObject.Save(0, &fs.vfsfs)
-	stateSinkObject.Save(1, &fs.mfp)
-	stateSinkObject.Save(2, &fs.clock)
-	stateSinkObject.Save(3, &fs.devMinor)
-	stateSinkObject.Save(4, &fs.mopts)
-	stateSinkObject.Save(5, &fs.usage)
-	stateSinkObject.Save(6, &fs.nextInoMinusOne)
-	stateSinkObject.Save(7, &fs.root)
+	stateSinkObject.Save(1, &fs.privateMF)
+	stateSinkObject.Save(2, &fs.mfp)
+	stateSinkObject.Save(3, &fs.clock)
+	stateSinkObject.Save(4, &fs.devMinor)
+	stateSinkObject.Save(5, &fs.mopts)
+	stateSinkObject.Save(6, &fs.usage)
+	stateSinkObject.Save(7, &fs.nextInoMinusOne)
+	stateSinkObject.Save(8, &fs.root)
+	stateSinkObject.Save(9, &fs.maxFilenameLen)
+	stateSinkObject.Save(10, &fs.maxSizeInPages)
+	stateSinkObject.Save(11, &fs.pagesUsed)
+	stateSinkObject.Save(12, &fs.allowXattrPrefix)
 }
-
-func (fs *filesystem) afterLoad() {}
 
 // +checklocksignore
 func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &fs.vfsfs)
-	stateSourceObject.Load(1, &fs.mfp)
-	stateSourceObject.Load(2, &fs.clock)
-	stateSourceObject.Load(3, &fs.devMinor)
-	stateSourceObject.Load(4, &fs.mopts)
-	stateSourceObject.Load(5, &fs.usage)
-	stateSourceObject.Load(6, &fs.nextInoMinusOne)
-	stateSourceObject.Load(7, &fs.root)
+	stateSourceObject.Load(1, &fs.privateMF)
+	stateSourceObject.Load(2, &fs.mfp)
+	stateSourceObject.Load(3, &fs.clock)
+	stateSourceObject.Load(4, &fs.devMinor)
+	stateSourceObject.Load(5, &fs.mopts)
+	stateSourceObject.Load(6, &fs.usage)
+	stateSourceObject.Load(7, &fs.nextInoMinusOne)
+	stateSourceObject.Load(8, &fs.root)
+	stateSourceObject.Load(9, &fs.maxFilenameLen)
+	stateSourceObject.Load(10, &fs.maxSizeInPages)
+	stateSourceObject.Load(11, &fs.pagesUsed)
+	stateSourceObject.Load(12, &fs.allowXattrPrefix)
+	stateSourceObject.AfterLoad(fs.afterLoad)
 }
 
 func (f *FilesystemOpts) StateTypeName() string {
@@ -422,6 +437,10 @@ func (f *FilesystemOpts) StateFields() []string {
 		"RootSymlinkTarget",
 		"FilesystemType",
 		"Usage",
+		"MaxFilenameLen",
+		"FilestoreFD",
+		"DisableDefaultSizeLimit",
+		"AllowXattrPrefix",
 	}
 }
 
@@ -434,6 +453,10 @@ func (f *FilesystemOpts) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &f.RootSymlinkTarget)
 	stateSinkObject.Save(2, &f.FilesystemType)
 	stateSinkObject.Save(3, &f.Usage)
+	stateSinkObject.Save(4, &f.MaxFilenameLen)
+	stateSinkObject.Save(5, &f.FilestoreFD)
+	stateSinkObject.Save(6, &f.DisableDefaultSizeLimit)
+	stateSinkObject.Save(7, &f.AllowXattrPrefix)
 }
 
 func (f *FilesystemOpts) afterLoad() {}
@@ -444,6 +467,10 @@ func (f *FilesystemOpts) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &f.RootSymlinkTarget)
 	stateSourceObject.Load(2, &f.FilesystemType)
 	stateSourceObject.Load(3, &f.Usage)
+	stateSourceObject.Load(4, &f.MaxFilenameLen)
+	stateSourceObject.Load(5, &f.FilestoreFD)
+	stateSourceObject.Load(6, &f.DisableDefaultSizeLimit)
+	stateSourceObject.Load(7, &f.AllowXattrPrefix)
 }
 
 func (d *dentry) StateTypeName() string {

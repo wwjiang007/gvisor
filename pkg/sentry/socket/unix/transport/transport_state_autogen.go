@@ -17,10 +17,9 @@ func (e *connectionedEndpoint) StateFields() []string {
 		"idGenerator",
 		"stype",
 		"acceptedChan",
+		"boundSocketFD",
 	}
 }
-
-func (e *connectionedEndpoint) beforeSave() {}
 
 // +checklocksignore
 func (e *connectionedEndpoint) StateSave(stateSinkObject state.Sink) {
@@ -32,6 +31,7 @@ func (e *connectionedEndpoint) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &e.id)
 	stateSinkObject.Save(2, &e.idGenerator)
 	stateSinkObject.Save(3, &e.stype)
+	stateSinkObject.Save(5, &e.boundSocketFD)
 }
 
 // +checklocksignore
@@ -40,7 +40,8 @@ func (e *connectionedEndpoint) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &e.id)
 	stateSourceObject.Load(2, &e.idGenerator)
 	stateSourceObject.Load(3, &e.stype)
-	stateSourceObject.LoadValue(4, new([]*connectionedEndpoint), func(y interface{}) { e.loadAcceptedChan(y.([]*connectionedEndpoint)) })
+	stateSourceObject.Load(5, &e.boundSocketFD)
+	stateSourceObject.LoadValue(4, new([]*connectionedEndpoint), func(y any) { e.loadAcceptedChan(y.([]*connectionedEndpoint)) })
 	stateSourceObject.AfterLoad(e.afterLoad)
 }
 
@@ -66,6 +67,63 @@ func (e *connectionlessEndpoint) StateSave(stateSinkObject state.Sink) {
 func (e *connectionlessEndpoint) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.baseEndpoint)
 	stateSourceObject.AfterLoad(e.afterLoad)
+}
+
+func (c *HostConnectedEndpoint) StateTypeName() string {
+	return "pkg/sentry/socket/unix/transport.HostConnectedEndpoint"
+}
+
+func (c *HostConnectedEndpoint) StateFields() []string {
+	return []string{
+		"HostConnectedEndpointRefs",
+		"fd",
+		"addr",
+		"stype",
+	}
+}
+
+func (c *HostConnectedEndpoint) beforeSave() {}
+
+// +checklocksignore
+func (c *HostConnectedEndpoint) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.HostConnectedEndpointRefs)
+	stateSinkObject.Save(1, &c.fd)
+	stateSinkObject.Save(2, &c.addr)
+	stateSinkObject.Save(3, &c.stype)
+}
+
+// +checklocksignore
+func (c *HostConnectedEndpoint) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.HostConnectedEndpointRefs)
+	stateSourceObject.Load(1, &c.fd)
+	stateSourceObject.Load(2, &c.addr)
+	stateSourceObject.Load(3, &c.stype)
+	stateSourceObject.AfterLoad(c.afterLoad)
+}
+
+func (r *HostConnectedEndpointRefs) StateTypeName() string {
+	return "pkg/sentry/socket/unix/transport.HostConnectedEndpointRefs"
+}
+
+func (r *HostConnectedEndpointRefs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (r *HostConnectedEndpointRefs) beforeSave() {}
+
+// +checklocksignore
+func (r *HostConnectedEndpointRefs) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.refCount)
+}
+
+// +checklocksignore
+func (r *HostConnectedEndpointRefs) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func (q *queue) StateTypeName() string {
@@ -256,6 +314,31 @@ func (m *message) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(3, &m.Address)
 }
 
+func (a *Address) StateTypeName() string {
+	return "pkg/sentry/socket/unix/transport.Address"
+}
+
+func (a *Address) StateFields() []string {
+	return []string{
+		"Addr",
+	}
+}
+
+func (a *Address) beforeSave() {}
+
+// +checklocksignore
+func (a *Address) StateSave(stateSinkObject state.Sink) {
+	a.beforeSave()
+	stateSinkObject.Save(0, &a.Addr)
+}
+
+func (a *Address) afterLoad() {}
+
+// +checklocksignore
+func (a *Address) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &a.Addr)
+}
+
 func (q *queueReceiver) StateTypeName() string {
 	return "pkg/sentry/socket/unix/transport.queueReceiver"
 }
@@ -386,12 +469,15 @@ func (e *baseEndpoint) StateLoad(stateSourceObject state.Source) {
 func init() {
 	state.Register((*connectionedEndpoint)(nil))
 	state.Register((*connectionlessEndpoint)(nil))
+	state.Register((*HostConnectedEndpoint)(nil))
+	state.Register((*HostConnectedEndpointRefs)(nil))
 	state.Register((*queue)(nil))
 	state.Register((*queueRefs)(nil))
 	state.Register((*messageList)(nil))
 	state.Register((*messageEntry)(nil))
 	state.Register((*ControlMessages)(nil))
 	state.Register((*message)(nil))
+	state.Register((*Address)(nil))
 	state.Register((*queueReceiver)(nil))
 	state.Register((*streamQueueReceiver)(nil))
 	state.Register((*connectedEndpoint)(nil))

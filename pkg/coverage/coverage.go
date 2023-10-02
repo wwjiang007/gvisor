@@ -23,6 +23,9 @@
 // coverage surface. This causes bazel to use the Go cover tool manually to
 // generate instrumented files. It injects a hook that registers all coverage
 // data with the coverdata package.
+//
+// Using coverdata.Counters requires sync/atomic integers.
+// +checkalignedignore
 package coverage
 
 import (
@@ -39,7 +42,7 @@ import (
 )
 
 var (
-	// coverageMu must be held while accessing coverdata.Cover. This prevents
+	// coverageMu must be held while accessing coverdata.*. This prevents
 	// concurrent reads/writes from multiple threads collecting coverage data.
 	coverageMu sync.RWMutex
 
@@ -61,7 +64,7 @@ const blockBitLength = 16
 
 // Available returns whether any coverage data is available.
 func Available() bool {
-	return len(coverdata.Cover.Blocks) > 0
+	return len(coverdata.Blocks) > 0
 }
 
 // EnableReport sets up coverage reporting.
@@ -102,7 +105,7 @@ func ClearCoverageData() {
 	// We do not use atomic operations while reading/writing to the counters,
 	// which would drastically degrade performance. Slight discrepancies due to
 	// racing is okay for the purposes of kcov.
-	for _, counters := range coverdata.Cover.Counters {
+	for _, counters := range coverdata.Counters {
 		for index := 0; index < len(counters); index++ {
 			counters[index] = 0
 		}
@@ -110,7 +113,7 @@ func ClearCoverageData() {
 }
 
 var coveragePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, 0)
 	},
 }
@@ -155,7 +158,7 @@ func ConsumeCoverageData(w io.Writer) int {
 	total := 0
 	var pcBuffer [8]byte
 	for fileNum, file := range globalData.files {
-		counters := coverdata.Cover.Counters[file]
+		counters := coverdata.Counters[file]
 		for index := 0; index < len(counters); index++ {
 			// We do not use atomic operations while reading/writing to the counters,
 			// which would drastically degrade performance. Slight discrepancies due to
@@ -180,11 +183,6 @@ func ConsumeCoverageData(w io.Writer) int {
 		}
 	}
 
-	if total == 0 {
-		// An empty profile indicates that coverage is not enabled, in which case
-		// there shouldn't be any task work registered.
-		panic("kcov task work is registered, but no coverage data was found")
-	}
 	return total
 }
 
@@ -194,13 +192,13 @@ func InitCoverageData() {
 	globalData.once.Do(func() {
 		// First, order all files. Then calculate synthetic PCs for every block
 		// (using the well-defined ordering for files as well).
-		for file := range coverdata.Cover.Blocks {
+		for file := range coverdata.Blocks {
 			globalData.files = append(globalData.files, file)
 		}
 		sort.Strings(globalData.files)
 
 		for fileNum, file := range globalData.files {
-			blocks := coverdata.Cover.Blocks[file]
+			blocks := coverdata.Blocks[file]
 			pcs := make([]uint64, 0, len(blocks))
 			for blockNum := range blocks {
 				pcs = append(pcs, calculateSyntheticPC(fileNum, blockNum))
@@ -226,8 +224,8 @@ func Report() error {
 
 	var err error
 	reportOnce.Do(func() {
-		for file, counters := range coverdata.Cover.Counters {
-			blocks := coverdata.Cover.Blocks[file]
+		for file, counters := range coverdata.Counters {
+			blocks := coverdata.Blocks[file]
 			for i := 0; i < len(counters); i++ {
 				if atomic.LoadUint32(&counters[i]) > 0 {
 					err = writeBlock(reportOutput, file, blocks[i])
@@ -260,7 +258,7 @@ func Symbolize(out io.Writer, pc uint64) error {
 // corresponding synthetic PCs.
 func WriteAllBlocks(out io.Writer) error {
 	for fileNum, file := range globalData.files {
-		for blockNum, block := range coverdata.Cover.Blocks[file] {
+		for blockNum, block := range coverdata.Blocks[file] {
 			if err := writeBlockWithPC(out, calculateSyntheticPC(fileNum, blockNum), file, block); err != nil {
 				return err
 			}
@@ -300,7 +298,7 @@ func fileFromIndex(i int) (string, error) {
 
 // blockFromIndex returns the i-th block in the given file.
 func blockFromIndex(file string, i int) (testing.CoverBlock, error) {
-	blocks, ok := coverdata.Cover.Blocks[file]
+	blocks, ok := coverdata.Blocks[file]
 	if !ok {
 		return testing.CoverBlock{}, fmt.Errorf("instrumented file %s does not exist", file)
 	}

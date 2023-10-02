@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/btree"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 )
 
@@ -60,7 +61,7 @@ func (f TCPFlags) Contains(o TCPFlags) bool {
 
 // String implements Stringer.String.
 func (f TCPFlags) String() string {
-	flagsStr := []byte("FSRPAU")
+	flagsStr := []byte("FSRPAUEC")
 	for i := range flagsStr {
 		if f&(1<<uint(i)) == 0 {
 			flagsStr[i] = ' '
@@ -77,6 +78,8 @@ const (
 	TCPFlagPsh
 	TCPFlagAck
 	TCPFlagUrg
+	TCPFlagEce
+	TCPFlagCwr
 )
 
 // Options that may be present in a TCP segment.
@@ -132,6 +135,8 @@ type TCPFields struct {
 
 // TCPSynOptions is used to return the parsed TCP Options in a syn
 // segment.
+//
+// +stateify savable
 type TCPSynOptions struct {
 	// MSS is the maximum segment size provided by the peer in the SYN.
 	MSS uint16
@@ -152,6 +157,10 @@ type TCPSynOptions struct {
 
 	// SACKPermitted is true if the SACK option was provided in the SYN/SYN-ACK.
 	SACKPermitted bool
+
+	// Flags if specified are set on the outgoing SYN. The SYN flag is
+	// always set.
+	Flags TCPFlags
 }
 
 // SACKBlock represents a single contiguous SACK block.
@@ -213,6 +222,10 @@ const (
 	// TCPMinimumMSS is the minimum acceptable value for MSS. This is the
 	// same as the value TCP_MIN_MSS defined net/tcp.h.
 	TCPMinimumMSS = IPv4MaximumHeaderSize + TCPHeaderMaximumSize + MinIPFragmentPayloadSize - IPv4MinimumSize - TCPMinimumSize
+
+	// TCPMinimumSendMSS is the minimum value for MSS in a sender. This is the
+	// same as the value TCP_MIN_SND_MSS in net/tcp.h.
+	TCPMinimumSendMSS = TCPOptionsMaximumSize + MinIPFragmentPayloadSize
 
 	// TCPMaximumMSS is the maximum acceptable value for MSS.
 	TCPMaximumMSS = 0xffff
@@ -288,8 +301,8 @@ func (b TCP) SetDestinationPort(port uint16) {
 }
 
 // SetChecksum sets the checksum field of the TCP header.
-func (b TCP) SetChecksum(checksum uint16) {
-	binary.BigEndian.PutUint16(b[TCPChecksumOffset:], checksum)
+func (b TCP) SetChecksum(xsum uint16) {
+	checksum.Put(b[TCPChecksumOffset:], xsum)
 }
 
 // SetDataOffset sets the data offset field of the TCP header. headerLen should
@@ -318,8 +331,8 @@ func (b TCP) SetWindowSize(rcvwnd uint16) {
 	binary.BigEndian.PutUint16(b[TCPWinSizeOffset:], rcvwnd)
 }
 
-// SetUrgentPoiner sets the window size field of the TCP header.
-func (b TCP) SetUrgentPoiner(urgentPointer uint16) {
+// SetUrgentPointer sets the window size field of the TCP header.
+func (b TCP) SetUrgentPointer(urgentPointer uint16) {
 	binary.BigEndian.PutUint16(b[TCPUrgentPtrOffset:], urgentPointer)
 }
 
@@ -328,13 +341,13 @@ func (b TCP) SetUrgentPoiner(urgentPointer uint16) {
 // and the checksum of the segment data.
 func (b TCP) CalculateChecksum(partialChecksum uint16) uint16 {
 	// Calculate the rest of the checksum.
-	return Checksum(b[:b.DataOffset()], partialChecksum)
+	return checksum.Checksum(b[:b.DataOffset()], partialChecksum)
 }
 
 // IsChecksumValid returns true iff the TCP header's checksum is valid.
 func (b TCP) IsChecksumValid(src, dst tcpip.Address, payloadChecksum, payloadLength uint16) bool {
 	xsum := PseudoHeaderChecksum(TCPProtocolNumber, src, dst, uint16(b.DataOffset())+payloadLength)
-	xsum = ChecksumCombine(xsum, payloadChecksum)
+	xsum = checksum.Combine(xsum, payloadChecksum)
 	return b.CalculateChecksum(xsum) == 0xffff
 }
 
@@ -360,11 +373,11 @@ func (b TCP) encodeSubset(seq, ack uint32, flags TCPFlags, rcvwnd uint16) {
 // Encode encodes all the fields of the TCP header.
 func (b TCP) Encode(t *TCPFields) {
 	b.encodeSubset(t.SeqNum, t.AckNum, t.Flags, t.WindowSize)
-	binary.BigEndian.PutUint16(b[TCPSrcPortOffset:], t.SrcPort)
-	binary.BigEndian.PutUint16(b[TCPDstPortOffset:], t.DstPort)
-	b[TCPDataOffset] = (t.DataOffset / 4) << 4
-	binary.BigEndian.PutUint16(b[TCPChecksumOffset:], t.Checksum)
-	binary.BigEndian.PutUint16(b[TCPUrgentPtrOffset:], t.UrgentPointer)
+	b.SetSourcePort(t.SrcPort)
+	b.SetDestinationPort(t.DstPort)
+	b.SetDataOffset(t.DataOffset)
+	b.SetChecksum(t.Checksum)
+	b.SetUrgentPointer(t.UrgentPointer)
 }
 
 // EncodePartial updates a subset of the fields of the TCP header. It is useful
@@ -377,17 +390,17 @@ func (b TCP) EncodePartial(partialChecksum, length uint16, seqnum, acknum uint32
 	tmp := make([]byte, 4)
 	binary.BigEndian.PutUint16(tmp, length)
 	binary.BigEndian.PutUint16(tmp[2:], uint16(flags))
-	checksum := Checksum(tmp, partialChecksum)
+	xsum := checksum.Checksum(tmp, partialChecksum)
 
 	// Encode the passed-in fields.
 	b.encodeSubset(seqnum, acknum, flags, rcvwnd)
 
 	// Add the contributions of the passed-in fields to the checksum.
-	checksum = Checksum(b[TCPSeqNumOffset:TCPSeqNumOffset+8], checksum)
-	checksum = Checksum(b[TCPWinSizeOffset:TCPWinSizeOffset+2], checksum)
+	xsum = checksum.Checksum(b[TCPSeqNumOffset:TCPSeqNumOffset+8], xsum)
+	xsum = checksum.Checksum(b[TCPWinSizeOffset:TCPWinSizeOffset+2], xsum)
 
 	// Encode the checksum.
-	b.SetChecksum(^checksum)
+	b.SetChecksum(^xsum)
 }
 
 // SetSourcePortWithChecksumUpdate implements ChecksummableTransport.
@@ -450,6 +463,9 @@ func ParseSynOptions(opts []byte, isAck bool) TCPSynOptions {
 				return synOpts
 			}
 			synOpts.MSS = mss
+			if mss < TCPMinimumSendMSS {
+				synOpts.MSS = TCPMinimumSendMSS
+			}
 			i += 4
 
 		case TCPOptionWS:
@@ -678,4 +694,24 @@ func Acceptable(segSeq seqnum.Value, segLen seqnum.Size, rcvNxt, rcvAcc seqnum.V
 	// differently, it uses segSeq <= rcvAcc, we'd want to keep the same behavior
 	// as Linux.
 	return rcvNxt.LessThan(segSeq.Add(segLen)) && segSeq.LessThanEq(rcvAcc)
+}
+
+// TCPValid returns true if the pkt has a valid TCP header. It checks whether:
+//   - The data offset is too small.
+//   - The data offset is too large.
+//   - The checksum is invalid.
+//
+// TCPValid corresponds to net/netfilter/nf_conntrack_proto_tcp.c:tcp_error.
+func TCPValid(hdr TCP, payloadChecksum func() uint16, payloadSize uint16, srcAddr, dstAddr tcpip.Address, skipChecksumValidation bool) (csum uint16, csumValid, ok bool) {
+	if offset := int(hdr.DataOffset()); offset < TCPMinimumSize || offset > len(hdr) {
+		return
+	}
+
+	if skipChecksumValidation {
+		csumValid = true
+	} else {
+		csum = hdr.Checksum()
+		csumValid = hdr.IsChecksumValid(srcAddr, dstAddr, payloadChecksum(), payloadSize)
+	}
+	return csum, csumValid, true
 }

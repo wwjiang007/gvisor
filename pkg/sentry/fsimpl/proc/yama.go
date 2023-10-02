@@ -17,15 +17,16 @@ package proc
 import (
 	"bytes"
 	"fmt"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -43,17 +44,19 @@ type yamaPtraceScope struct {
 	kernfs.DynamicBytesFile
 
 	// level is the ptrace_scope level.
-	level *int32
+	level *atomicbitops.Int32
 }
+
+var _ vfs.WritableDynamicBytesSource = (*yamaPtraceScope)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (s *yamaPtraceScope) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	_, err := fmt.Fprintf(buf, "%d\n", atomic.LoadInt32(s.level))
+	_, err := fmt.Fprintf(buf, "%d\n", s.level.Load())
 	return err
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (s *yamaPtraceScope) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (s *yamaPtraceScope) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if offset != 0 {
 		// Ignore partial writes.
 		return 0, linuxerr.EINVAL
@@ -76,6 +79,6 @@ func (s *yamaPtraceScope) Write(ctx context.Context, src usermem.IOSequence, off
 		return 0, linuxerr.EINVAL
 	}
 
-	atomic.StoreInt32(s.level, v)
+	s.level.Store(v)
 	return n, nil
 }

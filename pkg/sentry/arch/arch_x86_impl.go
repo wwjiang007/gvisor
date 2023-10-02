@@ -19,7 +19,6 @@
 package arch
 
 import (
-	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
 
@@ -33,9 +32,6 @@ type State struct {
 
 	// Our floating point state.
 	fpState fpu.State `state:"wait"`
-
-	// FeatureSet is a pointer to the currently active feature set.
-	FeatureSet *cpuid.FeatureSet
 }
 
 // afterLoad is invoked by stateify.

@@ -15,8 +15,6 @@
 package p9
 
 import (
-	"errors"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/fd"
 )
@@ -30,6 +28,10 @@ type AttacherOptions struct {
 	// AllocateOnDeleted is set to true if it's safe to call File.Allocate for
 	// deleted files.
 	AllocateOnDeleted bool
+
+	// MultiGetAttrSupported is set to true if it's safe to call
+	// File.MultiGetAttr with read concurrency guarantee only on start directory.
+	MultiGetAttrSupported bool
 }
 
 // NoServerOptions partially implements Attacher with empty AttacherOptions.
@@ -273,10 +275,19 @@ type File interface {
 
 	// Readdir reads directory entries.
 	//
-	// This may return io.EOF in addition to unix.Errno values.
+	// This may return io.EOF in addition to unix.Errno values. count is the
+	// number of bytes to read.
+	//
+	// direntOffset is the directory offset at which the read should happen.
+	// direntOffset can be set to 0 to start reading the directory from start.
+	// direntOffset is used more like a cookie. The unit of direntOffset is
+	// unspecified. Gofers can choose their own unit. The client must set it
+	// to one of the values returned in Dirent.Offset, preferably the last offset
+	// returned, which should cause the readdir to continue from where it was
+	// left off.
 	//
 	// On the server, Readdir has a read concurrency guarantee.
-	Readdir(offset uint64, count uint32) ([]Dirent, error)
+	Readdir(direntOffset uint64, count uint32) ([]Dirent, error)
 
 	// Readlink reads the link target.
 	//
@@ -294,6 +305,17 @@ type File interface {
 	// On the server, Flush has a read concurrency guarantee.
 	Flush() error
 
+	// Bind binds to a host unix domain socket. If successful, it creates a
+	// socket file on the host filesystem and returns a File for the newly
+	// created socket file. The File implementation must save the bound socket
+	// FD so that subsequent Listen and Accept operations on the File can be
+	// served.
+	//
+	// Bind is an extension to 9P2000.L, see version.go.
+	//
+	// On the server, Bind has a write concurrency guarantee.
+	Bind(sockType uint32, sockName string, uid UID, gid GID) (File, QID, AttrMask, Attr, error)
+
 	// Connect establishes a new host-socket backed connection with a
 	// socket. A File does not need to be opened before it can be connected
 	// and it can be connected to multiple times resulting in a unique
@@ -306,7 +328,7 @@ type File interface {
 	// Flags indicates the requested type of socket.
 	//
 	// On the server, Connect has a read concurrency guarantee.
-	Connect(flags ConnectFlags) (*fd.FD, error)
+	Connect(socketType SocketType) (*fd.FD, error)
 
 	// Renamed is called when this node is renamed.
 	//
@@ -348,51 +370,4 @@ func (*DisallowServerCalls) Renamed(File, string) {
 // ServerOptions implements Attacher.
 func (*DisallowServerCalls) ServerOptions() AttacherOptions {
 	panic("ServerOptions should not be called on the client")
-}
-
-// DefaultMultiGetAttr implements File.MultiGetAttr() on top of File.
-func DefaultMultiGetAttr(start File, names []string) ([]FullStat, error) {
-	stats := make([]FullStat, 0, len(names))
-	parent := start
-	closeParent := func() {
-		if parent != start {
-			_ = parent.Close()
-		}
-	}
-	defer closeParent()
-	mask := AttrMaskAll()
-	for i, name := range names {
-		if len(name) == 0 && i == 0 {
-			qid, valid, attr, err := parent.GetAttr(mask)
-			if err != nil {
-				return nil, err
-			}
-			stats = append(stats, FullStat{
-				QID:   qid,
-				Valid: valid,
-				Attr:  attr,
-			})
-			continue
-		}
-		qids, child, valid, attr, err := parent.WalkGetAttr([]string{name})
-		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				return stats, nil
-			}
-			return nil, err
-		}
-		closeParent()
-		parent = child
-		stats = append(stats, FullStat{
-			QID:   qids[0],
-			Valid: valid,
-			Attr:  attr,
-		})
-		if attr.Mode.FileType() != ModeDirectory {
-			// Doesn't need to continue if entry is not a dir. Including symlinks
-			// that cannot be followed.
-			break
-		}
-	}
-	return stats, nil
 }

@@ -16,6 +16,9 @@
 package inet
 
 import (
+	"time"
+
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -73,13 +76,19 @@ type Stack interface {
 	SetTCPRecovery(recovery TCPLossRecovery) error
 
 	// Statistics reports stack statistics.
-	Statistics(stat interface{}, arg string) error
+	Statistics(stat any, arg string) error
 
 	// RouteTable returns the network stack's route table.
 	RouteTable() []Route
 
+	// Pause pauses the network stack before save.
+	Pause()
+
 	// Resume restarts the network stack after restore.
 	Resume()
+
+	// Destroy the network stack.
+	Destroy()
 
 	// RegisteredEndpoints returns all endpoints which are currently registered.
 	RegisteredEndpoints() []stack.TransportEndpoint
@@ -101,6 +110,12 @@ type Stack interface {
 	// SetPortRange sets the UDP and TCP IPv4 and IPv6 ephemeral port range
 	// (inclusive).
 	SetPortRange(start uint16, end uint16) error
+
+	// GROTimeout returns the GRO timeout.
+	GROTimeout(NICID int32) (time.Duration, error)
+
+	// GROTimeout sets the GRO timeout.
+	SetGROTimeout(NICID int32, timeout time.Duration) error
 }
 
 // Interface contains information about a network interface.
@@ -120,6 +135,10 @@ type Interface struct {
 
 	// MTU is the maximum transmission unit.
 	MTU uint32
+
+	// Features are the device features queried from the host at
+	// stack creation time. These are immutable after startup.
+	Features []linux.EthtoolGetFeaturesBlock
 }
 
 // InterfaceAddr contains information about a network interface address.

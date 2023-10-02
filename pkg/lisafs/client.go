@@ -19,7 +19,6 @@ import (
 	"math"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
@@ -72,14 +71,11 @@ type Client struct {
 // the server and creates channels for fast IPC. NewClient takes ownership over
 // the passed socket. On success, it returns the initialized client along with
 // the root Inode.
-func NewClient(sock *unet.Socket, mountPath string) (*Client, *Inode, error) {
-	maxChans := maxChannels()
+func NewClient(sock *unet.Socket) (*Client, Inode, int, error) {
 	c := &Client{
-		sockComm:          newSockComm(sock),
-		channels:          make([]*channel, 0, maxChans),
-		availableChannels: make([]*channel, 0, maxChans),
-		maxMessageSize:    1 << 20, // 1 MB for now.
-		fdsToClose:        make([]FDID, 0, fdsToCloseBatchSize),
+		sockComm:       newSockComm(sock),
+		maxMessageSize: 1 << 20, // 1 MB for now.
+		fdsToClose:     make([]FDID, 0, fdsToCloseBatchSize),
 	}
 
 	// Start a goroutine to check socket health. This goroutine is also
@@ -87,22 +83,18 @@ func NewClient(sock *unet.Socket, mountPath string) (*Client, *Inode, error) {
 	c.watchdogWg.Add(1)
 	go c.watchdog()
 
-	// Clean everything up if anything fails.
-	cu := cleanup.Make(func() {
-		c.Close()
-	})
-	defer cu.Clean()
-
 	// Mount the server first. Assume Mount is supported so that we can make the
 	// Mount RPC below.
 	c.supported = make([]bool, Mount+1)
 	c.supported[Mount] = true
-	mountMsg := MountReq{
-		MountPath: SizedString(mountPath),
-	}
-	var mountResp MountResp
-	if err := c.SndRcvMessage(Mount, uint32(mountMsg.SizeBytes()), mountMsg.MarshalBytes, mountResp.CheckedUnmarshal, nil); err != nil {
-		return nil, nil, err
+	var (
+		mountReq    MountReq
+		mountResp   MountResp
+		mountHostFD = [1]int{-1}
+	)
+	if err := c.SndRcvMessage(Mount, uint32(mountReq.SizeBytes()), mountReq.MarshalBytes, mountResp.CheckedUnmarshal, mountHostFD[:], mountReq.String, mountResp.String); err != nil {
+		c.Close()
+		return nil, Inode{}, -1, err
 	}
 
 	// Initialize client.
@@ -117,21 +109,32 @@ func NewClient(sock *unet.Socket, mountPath string) (*Client, *Inode, error) {
 	for _, suppMID := range mountResp.SupportedMs {
 		c.supported[suppMID] = true
 	}
+	return c, mountResp.Root, mountHostFD[0], nil
+}
+
+// StartChannels starts maxChannels() channel communicators.
+func (c *Client) StartChannels() error {
+	maxChans := maxChannels()
+	c.channelsMu.Lock()
+	c.channels = make([]*channel, 0, maxChans)
+	c.availableChannels = make([]*channel, 0, maxChans)
+	c.channelsMu.Unlock()
 
 	// Create channels parallely so that channels can be used to create more
 	// channels and costly initialization like flipcall.Endpoint.Connect can
 	// proceed parallely.
 	var channelsWg sync.WaitGroup
-	channelErrs := make([]error, maxChans)
 	for i := 0; i < maxChans; i++ {
 		channelsWg.Add(1)
-		curChanID := i
 		go func() {
 			defer channelsWg.Done()
 			ch, err := c.createChannel()
 			if err != nil {
-				log.Warningf("channel creation failed: %v", err)
-				channelErrs[curChanID] = err
+				if err == unix.ENOMEM {
+					log.Debugf("channel creation failed because server hit max channels limit")
+				} else {
+					log.Warningf("channel creation failed: %v", err)
+				}
 				return
 			}
 			c.channelsMu.Lock()
@@ -142,15 +145,16 @@ func NewClient(sock *unet.Socket, mountPath string) (*Client, *Inode, error) {
 	}
 	channelsWg.Wait()
 
-	for _, channelErr := range channelErrs {
-		// Return the first non-nil channel creation error.
-		if channelErr != nil {
-			return nil, nil, channelErr
-		}
+	// Check that atleast 1 channel is created. This is not required by lisafs
+	// protocol. It exists to flag server side issues in channel creation.
+	c.channelsMu.Lock()
+	numChannels := len(c.channels)
+	c.channelsMu.Unlock()
+	if maxChans > 0 && numChannels == 0 {
+		log.Warningf("all channel RPCs failed")
+		return unix.ENOMEM
 	}
-	cu.Release()
-
-	return c, &mountResp.Root, nil
+	return nil
 }
 
 func (c *Client) watchdog() {
@@ -221,9 +225,12 @@ func (c *Client) Close() {
 }
 
 func (c *Client) createChannel() (*channel, error) {
-	var chanResp ChannelResp
+	var (
+		chanReq  ChannelReq
+		chanResp ChannelResp
+	)
 	var fds [2]int
-	if err := c.SndRcvMessage(Channel, 0, NoopMarshal, chanResp.CheckedUnmarshal, fds[:]); err != nil {
+	if err := c.SndRcvMessage(Channel, uint32(chanReq.SizeBytes()), chanReq.MarshalBytes, chanResp.CheckedUnmarshal, fds[:], chanReq.String, chanResp.String); err != nil {
 		return nil, err
 	}
 	if fds[0] < 0 || fds[1] < 0 {
@@ -259,12 +266,14 @@ func (c *Client) IsSupported(m MID) bool {
 	return int(m) < len(c.supported) && c.supported[m]
 }
 
-// CloseFDBatched either queues the passed FD to be closed or makes a batch
-// RPC to close all the accumulated FDs-to-close.
-func (c *Client) CloseFDBatched(ctx context.Context, fd FDID) {
+// CloseFD either queues the passed FD to be closed or makes a batch
+// RPC to close all the accumulated FDs-to-close. If flush is true, the RPC
+// is made immediately.
+func (c *Client) CloseFD(ctx context.Context, fd FDID, flush bool) {
 	c.fdsMu.Lock()
 	c.fdsToClose = append(c.fdsToClose, fd)
-	if len(c.fdsToClose) < fdsToCloseBatchSize {
+	if !flush && len(c.fdsToClose) < fdsToCloseBatchSize {
+		// We can continue batching.
 		c.fdsMu.Unlock()
 		return
 	}
@@ -280,8 +289,9 @@ func (c *Client) CloseFDBatched(ctx context.Context, fd FDID) {
 	c.fdsMu.Unlock()
 
 	req := CloseReq{FDs: toClose}
+	var resp CloseResp
 	ctx.UninterruptibleSleepStart(false)
-	err := c.SndRcvMessage(Close, uint32(req.SizeBytes()), req.MarshalBytes, NoopUnmarshal, nil)
+	err := c.SndRcvMessage(Close, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String)
 	ctx.UninterruptibleSleepFinish(false)
 	if err != nil {
 		log.Warningf("lisafs: batch closing FDs returned error: %v", err)
@@ -294,8 +304,9 @@ func (c *Client) SyncFDs(ctx context.Context, fds []FDID) error {
 		return nil
 	}
 	req := FsyncReq{FDs: fds}
+	var resp FsyncResp
 	ctx.UninterruptibleSleepStart(false)
-	err := c.SndRcvMessage(FSync, uint32(req.SizeBytes()), req.MarshalBytes, NoopUnmarshal, nil)
+	err := c.SndRcvMessage(FSync, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String)
 	ctx.UninterruptibleSleepFinish(false)
 	return err
 }
@@ -305,15 +316,11 @@ func (c *Client) SyncFDs(ctx context.Context, fds []FDID) error {
 // and invokes respUnmarshal with the response payload. respFDs is populated
 // with the received FDs, extra fields are set to -1.
 //
-// Note that the function arguments intentionally accept marshal.Marshallable
-// functions like Marshal{Bytes/Unsafe} and Unmarshal{Bytes/Unsafe} instead of
-// directly accepting the marshal.Marshallable interface. Even though just
-// accepting marshal.Marshallable is cleaner, it leads to a heap allocation
-// (even if that interface variable itself does not escape). In other words,
-// implicit conversion to an interface leads to an allocation.
+// See messages.go to understand why function arguments are used instead of
+// combining these functions into an interface type.
 //
-// Precondition: reqMarshal and respUnmarshal must be non-nil.
-func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal func(dst []byte) []byte, respUnmarshal func(src []byte) ([]byte, bool), respFDs []int) error {
+// Precondition: function arguments must be non-nil.
+func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal marshalFunc, respUnmarshal unmarshalFunc, respFDs []int, reqString debugStringer, respString debugStringer) error {
 	if !c.IsSupported(m) {
 		return unix.EOPNOTSUPP
 	}
@@ -330,6 +337,8 @@ func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal func(dst []b
 	// Acquire a communicator.
 	comm := c.acquireCommunicator()
 	defer c.releaseCommunicator(comm)
+
+	debugf("send", comm, reqString)
 
 	// Marshal the request into comm's payload buffer and make the RPC.
 	reqMarshal(comm.PayloadBuf(payloadLen))
@@ -366,6 +375,7 @@ func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal func(dst []b
 		closeFDs(respFDs)
 		var resp ErrorResp
 		resp.UnmarshalUnsafe(comm.PayloadBuf(respPayloadLen))
+		debugf("recv", comm, resp.String)
 		return unix.Errno(resp.errno)
 	}
 	if respM != m {
@@ -379,16 +389,25 @@ func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal func(dst []b
 		log.Warningf("server response unmarshalling for %d message failed", respM)
 		return unix.EIO
 	}
+	debugf("recv", comm, respString)
 	return nil
+}
+
+func debugf(action string, comm Communicator, debugMsg debugStringer) {
+	// Replicate the log.IsLogging(log.Debug) check to avoid having to call
+	// debugMsg() on the hot path.
+	if log.IsLogging(log.Debug) {
+		log.Debugf("%s [%s] %s", action, comm, debugMsg())
+	}
 }
 
 // Postcondition: releaseCommunicator() must be called on the returned value.
 func (c *Client) acquireCommunicator() Communicator {
 	// Prefer using channel over socket because:
-	// - Channel uses a shared memory region for passing messages. IO from shared
-	//   memory is faster and does not involve making a syscall.
-	// - No intermediate buffer allocation needed. With a channel, the message
-	//   can be directly pasted into the shared memory region.
+	//	- Channel uses a shared memory region for passing messages. IO from shared
+	//		memory is faster and does not involve making a syscall.
+	//	- No intermediate buffer allocation needed. With a channel, the message
+	//		can be directly pasted into the shared memory region.
 	if ch := c.getChannel(); ch != nil {
 		return ch
 	}

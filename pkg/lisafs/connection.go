@@ -15,6 +15,10 @@
 package lisafs
 
 import (
+	"path"
+	"path/filepath"
+	"runtime/debug"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
@@ -31,17 +35,25 @@ import (
 // the server and the other end is owned by the client. The connection may
 // spawn additional comunicational channels for the same mount for increased
 // RPC concurrency.
+//
+// Reference model:
+//   - When any FD is created, the connection takes a ref on it which represents
+//     the client's ref on the FD.
+//   - The client can drop its ref via the Close RPC which will in turn make the
+//     connection drop its ref.
 type Connection struct {
 	// server is the server on which this connection was created. It is immutably
 	// associated with it for its entire lifetime.
 	server *Server
 
+	// mountPath is the path to a file inside the server that is served to this
+	// connection as its root FD. IOW, this connection is mounted at this path.
+	// mountPath is trusted because it is configured by the server (trusted) as
+	// per the user's sandbox configuration. mountPath is immutable.
+	mountPath string
+
 	// maxMessageSize is the cached value of server.impl.MaxMessageSize().
 	maxMessageSize uint32
-
-	// mounted is a one way flag indicating whether this connection has been
-	// mounted correctly and the server is initialized properly.
-	mounted bool
 
 	// readonly indicates if this connection is readonly. All write operations
 	// will fail with EROFS.
@@ -71,13 +83,20 @@ type Connection struct {
 	nextFDID FDID
 }
 
-// CreateConnection initializes a new connection - creating a server if
-// required. The connection must be started separately.
-func (s *Server) CreateConnection(sock *unet.Socket, readonly bool) (*Connection, error) {
+// CreateConnection initializes a new connection which will be mounted at
+// mountPath. The connection must be started separately.
+func (s *Server) CreateConnection(sock *unet.Socket, mountPath string, readonly bool) (*Connection, error) {
+	mountPath = path.Clean(mountPath)
+	if !filepath.IsAbs(mountPath) {
+		log.Warningf("mountPath %q is not absolute", mountPath)
+		return nil, unix.EINVAL
+	}
+
 	c := &Connection{
 		sockComm:       newSockComm(sock),
 		server:         s,
 		maxMessageSize: s.impl.MaxMessageSize(),
+		mountPath:      mountPath,
 		readonly:       readonly,
 		channels:       make([]*channel, 0, maxChannels()),
 		fds:            make(map[FDID]genericFD),
@@ -90,11 +109,6 @@ func (s *Server) CreateConnection(sock *unet.Socket, readonly bool) (*Connection
 	}
 	c.channelAlloc = alloc
 	return c, nil
-}
-
-// Server returns the associated server.
-func (c *Connection) Server() *Server {
-	return c.server
 }
 
 // ServerImpl returns the associated server implementation.
@@ -156,7 +170,7 @@ func (c *Connection) respondError(comm Communicator, err unix.Errno) (MID, uint3
 	return Error, respLen, nil
 }
 
-func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (MID, uint32, []int) {
+func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (retM MID, retPayloadLen uint32, retFDs []int) {
 	if payloadLen > c.maxMessageSize {
 		log.Warningf("received payload is too large: %d bytes", payloadLen)
 		return c.respondError(comm, unix.EIO)
@@ -165,12 +179,20 @@ func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (MID
 		// c.close() has been called; the connection is shutting down.
 		return c.respondError(comm, unix.ECONNRESET)
 	}
-	defer c.reqGate.Leave()
+	defer func() {
+		c.reqGate.Leave()
 
-	if !c.mounted && m != Mount {
-		log.Warningf("connection must first be mounted")
-		return c.respondError(comm, unix.EINVAL)
-	}
+		// Don't allow a panic to propagate.
+		if err := recover(); err != nil {
+			// Include a useful log message.
+			log.Warningf("panic in handler: %v\n%s", err, debug.Stack())
+
+			// Wrap in an EREMOTEIO error; we don't really have a better way to
+			// describe this kind of error. EREMOTEIO is appropriate for a generic
+			// failed RPC message.
+			retM, retPayloadLen, retFDs = c.respondError(comm, unix.EREMOTEIO)
+		}
+	}()
 
 	// Check if the message is supported for forward compatibility.
 	if int(m) >= len(c.server.handlers) || c.server.handlers[m] == nil {
@@ -223,14 +245,14 @@ func (c *Connection) close() {
 
 	// Cleanup all FDs.
 	c.fdsMu.Lock()
+	defer c.fdsMu.Unlock()
 	for fdid := range c.fds {
-		fd := c.removeFDLocked(fdid)
+		fd := c.stopTrackingFD(fdid)
 		fd.DecRef(nil) // Drop the ref held by c.
 	}
-	c.fdsMu.Unlock()
 }
 
-// The caller gains a ref on the FD on success.
+// Postcondition: The caller gains a ref on the FD on success.
 func (c *Connection) lookupFD(id FDID) (genericFD, error) {
 	c.fdsMu.RLock()
 	defer c.fdsMu.RUnlock()
@@ -243,9 +265,9 @@ func (c *Connection) lookupFD(id FDID) (genericFD, error) {
 	return fd, nil
 }
 
-// LookupControlFD retrieves the control FD identified by id on this
+// lookupControlFD retrieves the control FD identified by id on this
 // connection. On success, the caller gains a ref on the FD.
-func (c *Connection) LookupControlFD(id FDID) (*ControlFD, error) {
+func (c *Connection) lookupControlFD(id FDID) (*ControlFD, error) {
 	fd, err := c.lookupFD(id)
 	if err != nil {
 		return nil, err
@@ -259,9 +281,9 @@ func (c *Connection) LookupControlFD(id FDID) (*ControlFD, error) {
 	return cfd, nil
 }
 
-// LookupOpenFD retrieves the open FD identified by id on this
+// lookupOpenFD retrieves the open FD identified by id on this
 // connection. On success, the caller gains a ref on the FD.
-func (c *Connection) LookupOpenFD(id FDID) (*OpenFD, error) {
+func (c *Connection) lookupOpenFD(id FDID) (*OpenFD, error) {
 	fd, err := c.lookupFD(id)
 	if err != nil {
 		return nil, err
@@ -273,6 +295,22 @@ func (c *Connection) LookupOpenFD(id FDID) (*OpenFD, error) {
 		return nil, unix.EINVAL
 	}
 	return ofd, nil
+}
+
+// lookupBoundSocketFD retrieves the boundSockedFD identified by id on this
+// connection. On success, the caller gains a ref on the FD.
+func (c *Connection) lookupBoundSocketFD(id FDID) (*BoundSocketFD, error) {
+	fd, err := c.lookupFD(id)
+	if err != nil {
+		return nil, err
+	}
+
+	bsfd, ok := fd.(*BoundSocketFD)
+	if !ok {
+		fd.DecRef(nil)
+		return nil, unix.EINVAL
+	}
+	return bsfd, nil
 }
 
 // insertFD inserts the passed fd into the internal datastructure to track FDs.
@@ -290,10 +328,10 @@ func (c *Connection) insertFD(fd genericFD) FDID {
 	return res
 }
 
-// RemoveFD makes c stop tracking the passed FDID and drops its ref on it.
-func (c *Connection) RemoveFD(id FDID) {
+// removeFD makes c stop tracking the passed FDID and drops its ref on it.
+func (c *Connection) removeFD(id FDID) {
 	c.fdsMu.Lock()
-	fd := c.removeFDLocked(id)
+	fd := c.stopTrackingFD(id)
 	c.fdsMu.Unlock()
 	if fd != nil {
 		// Drop the ref held by c. This can take arbitrarily long. So do not hold
@@ -302,27 +340,27 @@ func (c *Connection) RemoveFD(id FDID) {
 	}
 }
 
-// RemoveControlFDLocked is the same as RemoveFD with added preconditions.
+// removeControlFDLocked is the same as removeFD with added preconditions.
 //
 // Preconditions:
-// * server's rename mutex must at least be read locked.
-// * id must be pointing to a control FD.
-func (c *Connection) RemoveControlFDLocked(id FDID) {
+//   - server's rename mutex must at least be read locked.
+//   - id must be pointing to a control FD.
+func (c *Connection) removeControlFDLocked(id FDID) {
 	c.fdsMu.Lock()
-	fd := c.removeFDLocked(id)
+	fd := c.stopTrackingFD(id)
 	c.fdsMu.Unlock()
 	if fd != nil {
 		// Drop the ref held by c. This can take arbitrarily long. So do not hold
 		// c.fdsMu while calling it.
-		fd.(*ControlFD).DecRefLocked()
+		fd.(*ControlFD).decRefLocked()
 	}
 }
 
-// removeFDLocked makes c stop tracking the passed FDID. Note that the caller
+// stopTrackingFD makes c stop tracking the passed FDID. Note that the caller
 // must drop ref on the returned fd (preferably without holding c.fdsMu).
 //
 // Precondition: c.fdsMu is locked.
-func (c *Connection) removeFDLocked(id FDID) genericFD {
+func (c *Connection) stopTrackingFD(id FDID) genericFD {
 	fd := c.fds[id]
 	if fd == nil {
 		log.Warningf("removeFDLocked called on non-existent FDID %d", id)

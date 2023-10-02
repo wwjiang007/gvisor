@@ -39,6 +39,13 @@ import (
 )
 
 const (
+	cgroupv1FsName = "cgroup"
+	cgroupv2FsName = "cgroup2"
+
+	// procRoot is the procfs root this module uses.
+	procRoot = "/proc"
+
+	// cgroupRoot is the cgroupfs root this module uses.
 	cgroupRoot = "/sys/fs/cgroup"
 )
 
@@ -168,7 +175,8 @@ func fillFromAncestor(path string) (string, error) {
 }
 
 // countCpuset returns the number of CPU in a string formatted like:
-// 		"0-2,7,12-14  # bits 0, 1, 2, 7, 12, 13, and 14 set" - man 7 cpuset
+//
+//	"0-2,7,12-14  # bits 0, 1, 2, 7, 12, 13, and 14 set" - man 7 cpuset
 func countCpuset(cpuset string) (int, error) {
 	var count int
 	for _, p := range strings.Split(cpuset, ",") {
@@ -203,7 +211,7 @@ func countCpuset(cpuset string) (int, error) {
 
 // loadPaths loads cgroup paths for given 'pid', may be set to 'self'.
 func loadPaths(pid string) (map[string]string, error) {
-	procCgroup, err := os.Open(filepath.Join("/proc", pid, "cgroup"))
+	procCgroup, err := os.Open(filepath.Join(procRoot, pid, "cgroup"))
 	if err != nil {
 		return nil, err
 	}
@@ -211,16 +219,16 @@ func loadPaths(pid string) (map[string]string, error) {
 
 	// Load mountinfo for the current process, because it's where cgroups is
 	// being accessed from.
-	mountinfo, err := os.Open(filepath.Join("/proc/self/mountinfo"))
+	mountinfo, err := os.Open(filepath.Join(procRoot, "self/mountinfo"))
 	if err != nil {
 		return nil, err
 	}
 	defer mountinfo.Close()
 
-	return loadPathsHelper(procCgroup, mountinfo)
+	return loadPathsHelper(procCgroup, mountinfo, IsOnlyV2())
 }
 
-func loadPathsHelper(cgroup, mountinfo io.Reader) (map[string]string, error) {
+func loadPathsHelper(cgroup, mountinfo io.Reader, unified bool) (map[string]string, error) {
 	paths := make(map[string]string)
 
 	scanner := bufio.NewScanner(cgroup)
@@ -230,6 +238,10 @@ func loadPathsHelper(cgroup, mountinfo io.Reader) (map[string]string, error) {
 		tokens := strings.Split(scanner.Text(), ":")
 		if len(tokens) != 3 {
 			return nil, fmt.Errorf("invalid cgroups file, line: %q", scanner.Text())
+		}
+		if len(tokens[1]) == 0 && unified {
+			paths[cgroup2Key] = tokens[2]
+			continue
 		}
 		if len(tokens[1]) == 0 {
 			continue
@@ -251,33 +263,47 @@ func loadPathsHelper(cgroup, mountinfo io.Reader) (map[string]string, error) {
 	// which don't exist in container, so recover the container paths here by
 	// double-checking with /proc/[pid]/mountinfo
 	mountScanner := bufio.NewScanner(mountinfo)
+	haveCg2Path := false
 	for mountScanner.Scan() {
 		// Format: ID parent major:minor root mount-point options opt-fields - fs-type source super-options
 		// Example: 39 32 0:34 / /sys/fs/cgroup/devices rw,noexec shared:18 - cgroup cgroup rw,devices
 		fields := strings.Fields(mountScanner.Text())
-		if len(fields) < 9 || fields[len(fields)-3] != "cgroup" {
+		if len(fields) < 9 {
 			// Skip mounts that are not cgroup mounts.
 			continue
 		}
-		// Cgroup controller type is in the super-options field.
-		superOptions := strings.Split(fields[len(fields)-1], ",")
-		for _, opt := range superOptions {
-			// Remove prefix for cgroups with no controller, eg. systemd.
-			opt = strings.TrimPrefix(opt, "name=")
+		switch fields[len(fields)-3] {
+		case cgroupv1FsName:
+			// Cgroup controller type is in the super-options field.
+			superOptions := strings.Split(fields[len(fields)-1], ",")
+			for _, opt := range superOptions {
+				// Remove prefix for cgroups with no controller, eg. systemd.
+				opt = strings.TrimPrefix(opt, "name=")
 
-			// Only considers cgroup controllers that are registered, and skip other
-			// irrelevant options, e.g. rw.
-			if cgroupPath, ok := paths[opt]; ok {
-				rootDir := fields[3]
-				if rootDir != "/" {
-					// When cgroup is in submount, remove repeated path components from
-					// cgroup path to avoid duplicating them.
-					relCgroupPath, err := filepath.Rel(rootDir, cgroupPath)
-					if err != nil {
-						return nil, err
+				// Only considers cgroup controllers that are registered, and skip other
+				// irrelevant options, e.g. rw.
+				if cgroupPath, ok := paths[opt]; ok {
+					rootDir := fields[3]
+					if rootDir != "/" {
+						// When cgroup is in submount, remove repeated path components from
+						// cgroup path to avoid duplicating them.
+						relCgroupPath, err := filepath.Rel(rootDir, cgroupPath)
+						if err != nil {
+							return nil, err
+						}
+						paths[opt] = relCgroupPath
 					}
-					paths[opt] = relCgroupPath
 				}
+			}
+		case cgroupv2FsName:
+			if cgroupPath, ok := paths[cgroup2Key]; !haveCg2Path && ok {
+				root := fields[3]
+				relCgroupPath, err := filepath.Rel(root, cgroupPath)
+				if err != nil {
+					return nil, err
+				}
+				haveCg2Path = true
+				paths[cgroup2Key] = relCgroupPath
 			}
 		}
 	}
@@ -301,13 +327,15 @@ type Cgroup interface {
 }
 
 // cgroupV1 represents a group inside all controllers. For example:
-//   Name='/foo/bar' maps to /sys/fs/cgroup/<controller>/foo/bar on
-//   all controllers.
+//
+//	Name='/foo/bar' maps to /sys/fs/cgroup/<controller>/foo/bar on
+//	all controllers.
 //
 // If Name is relative, it uses the parent cgroup path to determine the
 // location. For example:
-//   Name='foo/bar' and Parent[ctrl]="/user.slice", then it will map to
-//   /sys/fs/cgroup/<ctrl>/user.slice/foo/bar
+//
+//	Name='foo/bar' and Parent[ctrl]="/user.slice", then it will map to
+//	/sys/fs/cgroup/<ctrl>/user.slice/foo/bar
 type cgroupV1 struct {
 	Name    string            `json:"name"`
 	Parents map[string]string `json:"parents"`
@@ -316,72 +344,136 @@ type cgroupV1 struct {
 
 // NewFromSpec creates a new Cgroup instance if the spec includes a cgroup path.
 // Returns nil otherwise. Cgroup paths are loaded based on the current process.
-func NewFromSpec(spec *specs.Spec) (Cgroup, error) {
+// If useSystemd is true, the Cgroup will be created and managed with
+// systemd. This requires systemd (>=v244) to be running on the host and the
+// cgroup path to be in the form `slice:prefix:name`.
+func NewFromSpec(spec *specs.Spec, useSystemd bool) (Cgroup, error) {
 	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
 		return nil, nil
 	}
-	return NewFromPath(spec.Linux.CgroupsPath)
+	return NewFromPath(spec.Linux.CgroupsPath, useSystemd)
 }
 
 // NewFromPath creates a new Cgroup instance from the specified relative path.
 // Cgroup paths are loaded based on the current process.
-func NewFromPath(cgroupsPath string) (Cgroup, error) {
-	return new("self", cgroupsPath)
+// If useSystemd is true, the Cgroup will be created and managed with
+// systemd. This requires systemd (>=v244) to be running on the host and the
+// cgroup path to be in the form `slice:prefix:name`.
+func NewFromPath(cgroupsPath string, useSystemd bool) (Cgroup, error) {
+	return new("self", cgroupsPath, useSystemd)
 }
 
 // NewFromPid loads cgroup for the given process.
-func NewFromPid(pid int) (Cgroup, error) {
-	return new(strconv.Itoa(pid), "")
+// If useSystemd is true, the Cgroup will be created and managed with
+// systemd. This requires systemd (>=v244) to be running on the host and the
+// cgroup path to be in the form `slice:prefix:name`.
+func NewFromPid(pid int, useSystemd bool) (Cgroup, error) {
+	return new(strconv.Itoa(pid), "", useSystemd)
 }
 
-func new(pid, cgroupsPath string) (Cgroup, error) {
-	var parents map[string]string
+func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
+	var (
+		parents map[string]string
+		err     error
+		cg      Cgroup
+	)
 
 	// If path is relative, load cgroup paths for the process to build the
 	// relative paths.
 	if !filepath.IsAbs(cgroupsPath) {
-		var err error
 		parents, err = loadPaths(pid)
 		if err != nil {
 			return nil, fmt.Errorf("finding current cgroups: %w", err)
 		}
 	}
-	cg := &cgroupV1{
-		Name:    cgroupsPath,
-		Parents: parents,
-		Own:     make(map[string]bool),
+
+	if IsOnlyV2() {
+		// The cgroupsPath is in a special `slice:prefix:name` format for systemd
+		// that should not be modified.
+		if p, ok := parents[cgroup2Key]; ok && !useSystemd {
+			// The cgroup of current pid will have tasks in it and we can't use
+			// that, instead, use the its parent which should not have tasks in it.
+			cgroupsPath = filepath.Join(filepath.Dir(p), cgroupsPath)
+		}
+		// Assume that for v2, cgroup is always mounted at cgroupRoot.
+		cg, err = newCgroupV2(cgroupRoot, cgroupsPath, useSystemd)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cg = &cgroupV1{
+			Name:    cgroupsPath,
+			Parents: parents,
+			Own:     make(map[string]bool),
+		}
 	}
-	log.Debugf("New cgroup for pid: %s, %+v", pid, cg)
+	log.Debugf("New cgroup for pid: %s, %T: %+v", pid, cg, cg)
 	return cg, nil
 }
 
 // CgroupJSON is a wrapper for Cgroup that can be encoded to JSON.
 type CgroupJSON struct {
-	Cgroup Cgroup `json:"cgroup"`
+	Cgroup Cgroup
 }
 
 type cgroupJSONv1 struct {
-	Cgroup *cgroupV1 `json:"cgroup"`
+	Cgroup *cgroupV1 `json:"cgroupv1"`
+}
+
+type cgroupJSONv2 struct {
+	Cgroup *cgroupV2 `json:"cgroupv2"`
+}
+
+type cgroupJSONSystemd struct {
+	Cgroup *cgroupSystemd `json:"cgroupsystemd"`
+}
+
+type cgroupJSONUnknown struct {
+	Cgroup any `json:"cgroupunknown"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON
 func (c *CgroupJSON) UnmarshalJSON(data []byte) error {
-	v1 := cgroupJSONv1{}
-	err := json.Unmarshal(data, &v1)
-	if v1.Cgroup != nil {
-		c.Cgroup = v1.Cgroup
+	m := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
 	}
-	return err
+
+	var cg Cgroup
+	if rm, ok := m["cgroupv1"]; ok {
+		cg = &cgroupV1{}
+		if err := json.Unmarshal(rm, cg); err != nil {
+			return err
+		}
+	} else if rm, ok := m["cgroupv2"]; ok {
+		cg = &cgroupV2{}
+		if err := json.Unmarshal(rm, cg); err != nil {
+			return err
+		}
+	} else if rm, ok := m["cgroupsystemd"]; ok {
+		cg = &cgroupSystemd{}
+		if err := json.Unmarshal(rm, cg); err != nil {
+			return err
+		}
+	}
+	c.Cgroup = cg
+	return nil
 }
 
 // MarshalJSON implements json.Marshaler.MarshalJSON
 func (c *CgroupJSON) MarshalJSON() ([]byte, error) {
 	if c.Cgroup == nil {
-		v1 := cgroupJSONv1{}
-		return json.Marshal(&v1)
+		return json.Marshal(cgroupJSONUnknown{})
 	}
-	v1 := cgroupJSONv1{Cgroup: c.Cgroup.(*cgroupV1)}
-	return json.Marshal(&v1)
+	switch c.Cgroup.(type) {
+	case *cgroupV1:
+		return json.Marshal(cgroupJSONv1{Cgroup: c.Cgroup.(*cgroupV1)})
+	case *cgroupV2:
+		return json.Marshal(cgroupJSONv2{Cgroup: c.Cgroup.(*cgroupV2)})
+	case *cgroupSystemd:
+		return json.Marshal(cgroupJSONSystemd{Cgroup: c.Cgroup.(*cgroupSystemd)})
+	}
+	return nil, nil
 }
 
 // Install creates and configures cgroups according to 'res'. If cgroup path

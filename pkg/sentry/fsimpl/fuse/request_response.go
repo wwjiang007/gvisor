@@ -15,13 +15,13 @@
 package fuse
 
 import (
-	"fmt"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
@@ -95,10 +95,6 @@ type Request struct {
 	hdr  *linux.FUSEHeaderIn
 	data []byte
 
-	// payload for this request: extra bytes to write after
-	// the data slice. Used by FUSE_WRITE.
-	payload []byte
-
 	// If this request is async.
 	async bool
 	// If we don't care its response.
@@ -112,9 +108,8 @@ func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint
 	defer conn.fd.mu.Unlock()
 	conn.fd.nextOpID += linux.FUSEOpID(reqIDStep)
 
-	hdrLen := (*linux.FUSEHeaderIn)(nil).SizeBytes()
 	hdr := linux.FUSEHeaderIn{
-		Len:    uint32(hdrLen + payload.SizeBytes()),
+		Len:    linux.SizeOfFUSEHeaderIn + uint32(payload.SizeBytes()),
 		Opcode: opcode,
 		Unique: conn.fd.nextOpID,
 		NodeID: ino,
@@ -125,8 +120,8 @@ func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint
 
 	buf := make([]byte, hdr.Len)
 
-	hdr.MarshalUnsafe(buf[:hdrLen])
-	payload.MarshalUnsafe(buf[hdrLen:])
+	hdr.MarshalUnsafe(buf[:linux.SizeOfFUSEHeaderIn])
+	payload.MarshalUnsafe(buf[linux.SizeOfFUSEHeaderIn:])
 
 	return &Request{
 		id:   hdr.Unique,
@@ -161,13 +156,13 @@ func newFutureResponse(req *Request) *futureResponse {
 
 // resolve blocks the task until the server responds to its corresponding request,
 // then returns a resolved response.
-func (f *futureResponse) resolve(t *kernel.Task) (*Response, error) {
+func (f *futureResponse) resolve(b context.Blocker) (*Response, error) {
 	// Return directly for async requests.
 	if f.async {
 		return nil, nil
 	}
 
-	if err := t.Block(f.ch); err != nil {
+	if err := b.Block(f.ch); err != nil {
 		return nil, err
 	}
 
@@ -216,7 +211,9 @@ func (r *Response) UnmarshalPayload(m marshal.Marshallable) error {
 	wantDataLen := uint32(m.SizeBytes())
 
 	if haveDataLen < wantDataLen {
-		return fmt.Errorf("payload too small. Minimum data lenth required: %d,  but got data length %d", wantDataLen, haveDataLen)
+		log.Warningf("fusefs: Payload too small. Minimum data length required: %d, but got data length %d", wantDataLen, haveDataLen)
+		return linuxerr.EINVAL
+
 	}
 
 	// The response data is empty unless there is some payload. And so, doesn't

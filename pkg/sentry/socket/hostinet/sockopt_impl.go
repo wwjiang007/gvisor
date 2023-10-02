@@ -18,13 +18,17 @@
 package hostinet
 
 import (
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 )
 
-func getSockOptLen(t *kernel.Task, level, name int) int {
-	return 0 // No custom options.
+func extraSockOpts(t *kernel.Task) []SockOpt {
+	return nil
+}
+func preGetSockOpt(t *kernel.Task, level, name int, optValAddr hostarch.Addr, opt []byte) error {
+	return nil
 }
 
-func setSockOptLen(t *kernel.Task, level, name int) int {
-	return 0 // No custom options.
+func postGetSockOpt(t *kernel.Task, level, name int, opt []byte) []byte {
+	return opt
 }

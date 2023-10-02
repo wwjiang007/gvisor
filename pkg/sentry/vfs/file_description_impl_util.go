@@ -23,7 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -78,12 +78,18 @@ func (FileDescriptionDefaultImpl) Readiness(mask waiter.EventMask) waiter.EventM
 
 // EventRegister implements waiter.Waitable.EventRegister analogously to
 // file_operations::poll == NULL in Linux.
-func (FileDescriptionDefaultImpl) EventRegister(e *waiter.Entry) {
+func (FileDescriptionDefaultImpl) EventRegister(e *waiter.Entry) error {
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister analogously to
 // file_operations::poll == NULL in Linux.
 func (FileDescriptionDefaultImpl) EventUnregister(e *waiter.Entry) {
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (FileDescriptionDefaultImpl) Epollable() bool {
+	return false
 }
 
 // PRead implements FileDescriptionImpl.PRead analogously to
@@ -137,7 +143,7 @@ func (FileDescriptionDefaultImpl) ConfigureMMap(ctx context.Context, opts *memma
 
 // Ioctl implements FileDescriptionImpl.Ioctl analogously to
 // file_operations::unlocked_ioctl == NULL in Linux.
-func (FileDescriptionDefaultImpl) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (FileDescriptionDefaultImpl) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	return 0, linuxerr.ENOTTY
 }
 
@@ -164,6 +170,16 @@ func (FileDescriptionDefaultImpl) SetXattr(ctx context.Context, opts SetXattrOpt
 // inode::i_opflags & IOP_XATTR == 0 in Linux.
 func (FileDescriptionDefaultImpl) RemoveXattr(ctx context.Context, name string) error {
 	return linuxerr.ENOTSUP
+}
+
+// RegisterFileAsyncHandler implements FileDescriptionImpl.RegisterFileAsyncHandler.
+func (FileDescriptionDefaultImpl) RegisterFileAsyncHandler(fd *FileDescription) error {
+	return fd.asyncHandler.Register(fd)
+}
+
+// UnregisterFileAsyncHandler implements FileDescriptionImpl.UnregisterFileAsyncHandler.
+func (FileDescriptionDefaultImpl) UnregisterFileAsyncHandler(fd *FileDescription) {
+	fd.asyncHandler.Unregister(fd)
 }
 
 // DirectoryFileDescriptionDefaultImpl may be embedded by implementations of
@@ -245,7 +261,7 @@ type WritableDynamicBytesSource interface {
 	DynamicBytesSource
 
 	// Write sends writes to the source.
-	Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error)
+	Write(ctx context.Context, fd *FileDescription, src usermem.IOSequence, offset int64) (int64, error)
 }
 
 // DynamicBytesFileDescriptionImpl may be embedded by implementations of
@@ -256,11 +272,12 @@ type WritableDynamicBytesSource interface {
 // If data additionally implements WritableDynamicBytesSource, writes are
 // dispatched to the implementer. The source data is not automatically modified.
 //
-// DynamicBytesFileDescriptionImpl.SetDataSource() must be called before first
+// DynamicBytesFileDescriptionImpl.Init() must be called before first
 // use.
 //
 // +stateify savable
 type DynamicBytesFileDescriptionImpl struct {
+	vfsfd    *FileDescription   // immutable
 	data     DynamicBytesSource // immutable
 	mu       sync.Mutex         `state:"nosave"` // protects the following fields
 	buf      bytes.Buffer       `state:".([]byte)"`
@@ -276,8 +293,9 @@ func (fd *DynamicBytesFileDescriptionImpl) loadBuf(p []byte) {
 	fd.buf.Write(p)
 }
 
-// SetDataSource must be called exactly once on fd before first use.
-func (fd *DynamicBytesFileDescriptionImpl) SetDataSource(data DynamicBytesSource) {
+// Init must be called before first use.
+func (fd *DynamicBytesFileDescriptionImpl) Init(vfsfd *FileDescription, data DynamicBytesSource) {
+	fd.vfsfd = vfsfd
 	fd.data = data
 }
 
@@ -370,7 +388,7 @@ func (fd *DynamicBytesFileDescriptionImpl) pwriteLocked(ctx context.Context, src
 	if !ok {
 		return 0, linuxerr.EIO
 	}
-	n, err := writable.Write(ctx, src, offset)
+	n, err := writable.Write(ctx, fd.vfsfd, src, offset)
 	if err != nil {
 		return 0, err
 	}
@@ -433,7 +451,7 @@ func (fd *LockFD) Locks() *FileLocks {
 }
 
 // LockBSD implements FileDescriptionImpl.LockBSD.
-func (fd *LockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block fslock.Blocker) error {
+func (fd *LockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
 	return fd.locks.LockBSD(ctx, uid, ownerPID, t, block)
 }
 
@@ -444,7 +462,7 @@ func (fd *LockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
 }
 
 // LockPOSIX implements FileDescriptionImpl.LockPOSIX.
-func (fd *LockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
+func (fd *LockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
 	return fd.locks.LockPOSIX(ctx, uid, ownerPID, t, r, block)
 }
 
@@ -456,6 +474,18 @@ func (fd *LockFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fslock
 // TestPOSIX implements FileDescriptionImpl.TestPOSIX.
 func (fd *LockFD) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
 	return fd.locks.TestPOSIX(ctx, uid, t, r)
+}
+
+// NoAsyncEventFD implements [Un]RegisterFileAsyncHandler of FileDescriptionImpl.
+type NoAsyncEventFD struct{}
+
+// RegisterFileAsyncHandler implements FileDescriptionImpl.RegisterFileAsyncHandler.
+func (NoAsyncEventFD) RegisterFileAsyncHandler(fd *FileDescription) error {
+	return nil
+}
+
+// UnregisterFileAsyncHandler implements FileDescriptionImpl.UnregisterFileAsyncHandler.
+func (NoAsyncEventFD) UnregisterFileAsyncHandler(fd *FileDescription) {
 }
 
 // NoLockFD implements Lock*/Unlock* portion of FileDescriptionImpl interface
@@ -470,7 +500,7 @@ func (NoLockFD) SupportsLocks() bool {
 }
 
 // LockBSD implements FileDescriptionImpl.LockBSD.
-func (NoLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block fslock.Blocker) error {
+func (NoLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
 	return linuxerr.ENOLCK
 }
 
@@ -480,7 +510,7 @@ func (NoLockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
 }
 
 // LockPOSIX implements FileDescriptionImpl.LockPOSIX.
-func (NoLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
+func (NoLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
 	return linuxerr.ENOLCK
 }
 
@@ -506,7 +536,7 @@ func (BadLockFD) SupportsLocks() bool {
 }
 
 // LockBSD implements FileDescriptionImpl.LockBSD.
-func (BadLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block fslock.Blocker) error {
+func (BadLockFD) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, block bool) error {
 	return linuxerr.EBADF
 }
 
@@ -516,7 +546,7 @@ func (BadLockFD) UnlockBSD(ctx context.Context, uid fslock.UniqueID) error {
 }
 
 // LockPOSIX implements FileDescriptionImpl.LockPOSIX.
-func (BadLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block fslock.Blocker) error {
+func (BadLockFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
 	return linuxerr.EBADF
 }
 

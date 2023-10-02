@@ -16,29 +16,33 @@ package lisafs
 
 import (
 	"fmt"
-	"path"
-	"path/filepath"
+	"math"
 	"strings"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
+	"gvisor.dev/gvisor/pkg/p9"
 )
 
 const (
 	allowedOpenFlags     = unix.O_ACCMODE | unix.O_TRUNC
 	setStatSupportedMask = unix.STATX_MODE | unix.STATX_UID | unix.STATX_GID | unix.STATX_SIZE | unix.STATX_ATIME | unix.STATX_MTIME
+	// unixDirentMaxSize is the maximum size of unix.Dirent for amd64.
+	unixDirentMaxSize = 280
 )
 
 // RPCHandler defines a handler that is invoked when the associated message is
 // received. The handler is responsible for:
 //
-// * Unmarshalling the request from the passed payload and interpreting it.
-// * Marshalling the response into the communicator's payload buffer.
-// * Return the number of payload bytes written.
-// * Donate any FDs (if needed) to comm which will in turn donate it to client.
+//   - Unmarshalling the request from the passed payload and interpreting it.
+//   - Marshalling the response into the communicator's payload buffer.
+//   - Return the number of payload bytes written.
+//   - Donate any FDs (if needed) to comm which will in turn donate it to client.
 type RPCHandler func(c *Connection, comm Communicator, payloadLen uint32) (uint32, error)
 
 var handlers = [...]RPCHandler{
@@ -63,7 +67,6 @@ var handlers = [...]RPCHandler{
 	FAllocate:    FAllocateHandler,
 	ReadLinkAt:   ReadLinkAtHandler,
 	Flush:        FlushHandler,
-	Connect:      ConnectHandler,
 	UnlinkAt:     UnlinkAtHandler,
 	RenameAt:     RenameAtHandler,
 	Getdents64:   Getdents64Handler,
@@ -71,6 +74,10 @@ var handlers = [...]RPCHandler{
 	FSetXattr:    FSetXattrHandler,
 	FListXattr:   FListXattrHandler,
 	FRemoveXattr: FRemoveXattrHandler,
+	Connect:      ConnectHandler,
+	BindAt:       BindAtHandler,
+	Listen:       ListenHandler,
+	Accept:       AcceptHandler,
 }
 
 // ErrorHandler handles Error message.
@@ -84,31 +91,69 @@ func ErrorHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 // that Mount is the first message on the connection. Only after the connection
 // has been successfully mounted can other channels be created.
 func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
-	var req MountReq
-	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
-		return 0, unix.EIO
-	}
+	var (
+		mountPointFD     *ControlFD
+		mountPointHostFD = -1
+		mountPointStat   linux.Statx
+		mountNode        = c.server.root
+	)
+	if err := c.server.withRenameReadLock(func() (err error) {
+		// Maintain extra ref on mountNode to ensure existence during walk.
+		mountNode.IncRef()
+		defer func() {
+			// Drop extra ref on mountNode. Wrap the defer call with a func so that
+			// mountNode is evaluated on execution, not on defer itself.
+			mountNode.DecRef(nil)
+		}()
 
-	mountPath := path.Clean(string(req.MountPath))
-	if !filepath.IsAbs(mountPath) {
-		log.Warningf("mountPath %q is not absolute", mountPath)
-		return 0, unix.EINVAL
-	}
+		// Walk to the mountpoint.
+		pit := fspath.Parse(c.mountPath).Begin
+		for pit.Ok() {
+			curName := pit.String()
+			if err := checkSafeName(curName); err != nil {
+				return err
+			}
+			mountNode.opMu.RLock()
+			if mountNode.isDeleted() {
+				mountNode.opMu.RUnlock()
+				return unix.ENOENT
+			}
+			mountNode.childrenMu.Lock()
+			next := mountNode.LookupChildLocked(curName)
+			if next == nil {
+				next = &Node{}
+				next.InitLocked(curName, mountNode)
+			} else {
+				next.IncRef()
+			}
+			mountNode.childrenMu.Unlock()
+			mountNode.opMu.RUnlock()
+			// next has an extra ref as needed. Drop extra ref on mountNode.
+			mountNode.DecRef(nil)
+			pit = pit.Next()
+			mountNode = next
+		}
 
-	if c.mounted {
-		log.Warningf("connection has already been mounted at %q", mountPath)
-		return 0, unix.EBUSY
-	}
-
-	rootFD, rootIno, err := c.ServerImpl().Mount(c, mountPath)
-	if err != nil {
+		// Provide Mount with read concurrency guarantee.
+		mountNode.opMu.RLock()
+		defer mountNode.opMu.RUnlock()
+		if mountNode.isDeleted() {
+			return unix.ENOENT
+		}
+		mountPointFD, mountPointStat, mountPointHostFD, err = c.ServerImpl().Mount(c, mountNode)
+		return err
+	}); err != nil {
 		return 0, err
 	}
 
-	c.server.addMountPoint(rootFD.FD())
-	c.mounted = true
+	if mountPointHostFD >= 0 {
+		comm.DonateFD(mountPointHostFD)
+	}
 	resp := MountResp{
-		Root:           rootIno,
+		Root: Inode{
+			ControlFD: mountPointFD.id,
+			Stat:      mountPointStat,
+		},
 		SupportedMs:    c.ServerImpl().SupportedMessages(),
 		MaxMessageSize: primitive.Uint32(c.ServerImpl().MaxMessageSize()),
 	}
@@ -144,12 +189,8 @@ func ChannelHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 	}
 
 	// Respond to client with successful channel creation message.
-	if err := comm.DonateFD(clientDataFD); err != nil {
-		return 0, err
-	}
-	if err := comm.DonateFD(fdSock); err != nil {
-		return 0, err
-	}
+	comm.DonateFD(clientDataFD)
+	comm.DonateFD(fdSock)
 	resp := ChannelResp{
 		dataOffset: desc.Offset,
 		dataLength: uint64(desc.Length),
@@ -172,14 +213,27 @@ func FStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	}
 	defer fd.DecRef(nil)
 
+	var resp linux.Statx
 	switch t := fd.(type) {
 	case *ControlFD:
-		return t.impl.Stat(c, comm)
+		t.safelyRead(func() error {
+			resp, err = t.impl.Stat()
+			return err
+		})
 	case *OpenFD:
-		return t.impl.Stat(c, comm)
+		t.controlFD.safelyRead(func() error {
+			resp, err = t.impl.Stat()
+			return err
+		})
 	default:
 		panic(fmt.Sprintf("unknown fd type %T", t))
 	}
+	if err != nil {
+		return 0, err
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // SetStatHandler handles the SetStat RPC.
@@ -193,7 +247,7 @@ func SetStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
@@ -203,7 +257,23 @@ func SetStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, unix.EPERM
 	}
 
-	return fd.impl.SetStat(c, comm, req)
+	var resp SetStatResp
+	if err := fd.safelyWrite(func() error {
+		if fd.node.isDeleted() && !c.server.opts.SetAttrOnDeleted {
+			return unix.EINVAL
+		}
+		failureMask, failureErr := fd.impl.SetStat(req)
+		resp.FailureMask = failureMask
+		if failureErr != nil {
+			resp.FailureErrNo = uint32(p9.ExtractErrno(failureErr))
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // WalkHandler handles the Walk RPC.
@@ -213,21 +283,88 @@ func WalkHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, e
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	startDir, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
-	defer fd.DecRef(nil)
-	if !fd.IsDir() {
+	defer startDir.DecRef(nil)
+	if !startDir.IsDir() {
 		return 0, unix.ENOTDIR
 	}
-	for _, name := range req.Path {
-		if err := checkSafeName(name); err != nil {
-			return 0, err
+
+	// Manually marshal the inodes into the payload buffer during walk to avoid
+	// the slice allocation. The memory format should be WalkResp's.
+	var (
+		numInodes primitive.Uint16
+		status    = WalkSuccess
+	)
+	respMetaSize := status.SizeBytes() + numInodes.SizeBytes()
+	maxPayloadSize := respMetaSize + (len(req.Path) * (*Inode)(nil).SizeBytes())
+	if maxPayloadSize > math.MaxUint32 {
+		// Too much to walk, can't do.
+		return 0, unix.EIO
+	}
+	payloadBuf := comm.PayloadBuf(uint32(maxPayloadSize))
+	payloadPos := respMetaSize
+	if err := c.server.withRenameReadLock(func() error {
+		curDir := startDir
+		cu := cleanup.Make(func() {
+			// Destroy all newly created FDs until now. Read the new FDIDs from the
+			// payload buffer.
+			buf := comm.PayloadBuf(uint32(maxPayloadSize))[respMetaSize:]
+			var curIno Inode
+			for i := 0; i < int(numInodes); i++ {
+				buf = curIno.UnmarshalBytes(buf)
+				c.removeControlFDLocked(curIno.ControlFD)
+			}
+		})
+		defer cu.Clean()
+
+		for _, name := range req.Path {
+			if err := checkSafeName(name); err != nil {
+				return err
+			}
+			// Symlinks terminate walk. This client gets the symlink inode, but will
+			// have to invoke Walk again with the resolved path.
+			if curDir.IsSymlink() {
+				status = WalkComponentSymlink
+				break
+			}
+			curDir.node.opMu.RLock()
+			if curDir.node.isDeleted() {
+				// It is not safe to walk on a deleted directory. It could have been
+				// replaced with a malicious symlink.
+				curDir.node.opMu.RUnlock()
+				status = WalkComponentDoesNotExist
+				break
+			}
+			child, childStat, err := curDir.impl.Walk(name)
+			curDir.node.opMu.RUnlock()
+			if err == unix.ENOENT {
+				status = WalkComponentDoesNotExist
+				break
+			}
+			if err != nil {
+				return err
+			}
+			// Write inode into payload buffer.
+			i := Inode{ControlFD: child.id, Stat: childStat}
+			i.MarshalUnsafe(payloadBuf[payloadPos:])
+			payloadPos += i.SizeBytes()
+			numInodes++
+			curDir = child
 		}
+		cu.Release()
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 
-	return fd.impl.Walk(c, comm, req.Path)
+	// WalkResp writes the walk status followed by the number of inodes in the
+	// beginning.
+	payloadBuf = status.MarshalUnsafe(payloadBuf)
+	numInodes.MarshalUnsafe(payloadBuf)
+	return uint32(payloadPos), nil
 }
 
 // WalkStatHandler handles the WalkStat RPC.
@@ -237,15 +374,15 @@ func WalkStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	startDir, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
-	defer fd.DecRef(nil)
+	defer startDir.DecRef(nil)
 
 	// Note that this fd is allowed to not actually be a directory when the
 	// only path component to walk is "" (self).
-	if !fd.IsDir() {
+	if !startDir.IsDir() {
 		if len(req.Path) > 1 || (len(req.Path) == 1 && len(req.Path[0]) > 0) {
 			return 0, unix.ENOTDIR
 		}
@@ -260,7 +397,95 @@ func WalkStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		}
 	}
 
-	return fd.impl.WalkStat(c, comm, req.Path)
+	// We will manually marshal the statx results into the payload buffer as they
+	// are generated to avoid the slice allocation. The memory format should be
+	// the same as WalkStatResp's.
+	var numStats primitive.Uint16
+	maxPayloadSize := numStats.SizeBytes() + (len(req.Path) * linux.SizeOfStatx)
+	if maxPayloadSize > math.MaxUint32 {
+		// Too much to walk, can't do.
+		return 0, unix.EIO
+	}
+	payloadBuf := comm.PayloadBuf(uint32(maxPayloadSize))
+	payloadPos := numStats.SizeBytes()
+
+	if c.server.opts.WalkStatSupported {
+		if err = startDir.safelyRead(func() error {
+			return startDir.impl.WalkStat(req.Path, func(s linux.Statx) {
+				s.MarshalUnsafe(payloadBuf[payloadPos:])
+				payloadPos += s.SizeBytes()
+				numStats++
+			})
+		}); err != nil {
+			return 0, err
+		}
+		// WalkStatResp writes the number of stats in the beginning.
+		numStats.MarshalUnsafe(payloadBuf)
+		return uint32(payloadPos), nil
+	}
+
+	if err = c.server.withRenameReadLock(func() error {
+		if len(req.Path) > 0 && len(req.Path[0]) == 0 {
+			startDir.node.opMu.RLock()
+			stat, err := startDir.impl.Stat()
+			startDir.node.opMu.RUnlock()
+			if err != nil {
+				return err
+			}
+			stat.MarshalUnsafe(payloadBuf[payloadPos:])
+			payloadPos += stat.SizeBytes()
+			numStats++
+			req.Path = req.Path[1:]
+		}
+
+		parent := startDir
+		closeParent := func() {
+			if parent != startDir {
+				c.removeControlFDLocked(parent.id)
+			}
+		}
+		defer closeParent()
+
+		for _, name := range req.Path {
+			parent.node.opMu.RLock()
+			if parent.node.isDeleted() {
+				// It is not safe to walk on a deleted directory. It could have been
+				// replaced with a malicious symlink.
+				parent.node.opMu.RUnlock()
+				break
+			}
+			child, childStat, err := parent.impl.Walk(name)
+			parent.node.opMu.RUnlock()
+			if err != nil {
+				if err == unix.ENOENT {
+					break
+				}
+				return err
+			}
+
+			// Update with next generation.
+			closeParent()
+			parent = child
+
+			// Write results.
+			childStat.MarshalUnsafe(payloadBuf[payloadPos:])
+			payloadPos += childStat.SizeBytes()
+			numStats++
+
+			// Symlinks terminate walk. This client gets the symlink stat result, but
+			// will have to invoke Walk again with the resolved path.
+			if childStat.Mode&unix.S_IFMT == unix.S_IFLNK {
+				break
+			}
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	// WalkStatResp writes the number of stats in the beginning.
+	numStats.MarshalUnsafe(payloadBuf)
+	return uint32(payloadPos), nil
 }
 
 // OpenAtHandler handles the OpenAt RPC.
@@ -282,7 +507,7 @@ func OpenAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 		return 0, unix.EROFS
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
@@ -294,7 +519,27 @@ func OpenAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 		}
 	}
 
-	return fd.impl.Open(c, comm, req.Flags)
+	var (
+		openFD     *OpenFD
+		hostOpenFD int
+	)
+	if err := fd.safelyRead(func() error {
+		if fd.node.isDeleted() || fd.IsSymlink() {
+			return unix.EINVAL
+		}
+		openFD, hostOpenFD, err = fd.impl.Open(req.Flags)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	if hostOpenFD >= 0 {
+		comm.DonateFD(hostOpenFD)
+	}
+	resp := OpenAtResp{OpenFD: openFD.id}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // OpenCreateAtHandler handles the OpenCreateAt RPC.
@@ -318,7 +563,7 @@ func OpenCreateAtHandler(c *Connection, comm Communicator, payloadLen uint32) (u
 		return 0, err
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	fd, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
@@ -327,7 +572,35 @@ func OpenCreateAtHandler(c *Connection, comm Communicator, payloadLen uint32) (u
 		return 0, unix.ENOTDIR
 	}
 
-	return fd.impl.OpenCreate(c, comm, req.Mode, req.UID, req.GID, name, uint32(req.Flags))
+	var (
+		childFD    *ControlFD
+		childStat  linux.Statx
+		openFD     *OpenFD
+		hostOpenFD int
+	)
+	if err := fd.safelyWrite(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		childFD, childStat, openFD, hostOpenFD, err = fd.impl.OpenCreate(req.Mode, req.UID, req.GID, name, uint32(req.Flags))
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	if hostOpenFD >= 0 {
+		comm.DonateFD(hostOpenFD)
+	}
+	resp := OpenCreateAtResp{
+		NewFD: openFD.id,
+		Child: Inode{
+			ControlFD: childFD.id,
+			Stat:      childStat,
+		},
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // CloseHandler handles the Close RPC.
@@ -337,7 +610,7 @@ func CloseHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 		return 0, unix.EIO
 	}
 	for _, fd := range req.FDs {
-		c.RemoveFD(fd)
+		c.removeFD(fd)
 	}
 
 	// There is no response message for this.
@@ -365,11 +638,14 @@ func FSyncHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 }
 
 func (c *Connection) fsyncFD(id FDID) error {
-	fd, err := c.LookupOpenFD(id)
+	fd, err := c.lookupOpenFD(id)
 	if err != nil {
 		return err
 	}
-	return fd.impl.Sync(c)
+	defer fd.DecRef(nil)
+	return fd.controlFD.safelyRead(func() error {
+		return fd.impl.Sync()
+	})
 }
 
 // PWriteHandler handles the PWrite RPC.
@@ -385,14 +661,25 @@ func PWriteHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupOpenFD(req.FD)
+	fd, err := c.lookupOpenFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
+	defer fd.DecRef(nil)
 	if !fd.writable {
 		return 0, unix.EBADF
 	}
-	return fd.impl.Write(c, comm, req.Buf, uint64(req.Offset))
+	var count uint64
+	if err := fd.controlFD.safelyWrite(func() error {
+		count, err = fd.impl.Write(req.Buf, uint64(req.Offset))
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	resp := PWriteResp{Count: count}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // PReadHandler handles the PRead RPC.
@@ -402,7 +689,7 @@ func PReadHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupOpenFD(req.FD)
+	fd, err := c.lookupOpenFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
@@ -410,7 +697,29 @@ func PReadHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	if !fd.readable {
 		return 0, unix.EBADF
 	}
-	return fd.impl.Read(c, comm, req.Offset, req.Count)
+
+	// To save an allocation and a copy, we directly read into the payload
+	// buffer. The rest of the response message is manually marshalled.
+	var resp PReadResp
+	respMetaSize := uint32(resp.NumBytes.SizeBytes())
+	respPayloadLen := respMetaSize + req.Count
+	if respPayloadLen > c.maxMessageSize {
+		return 0, unix.ENOBUFS
+	}
+	payloadBuf := comm.PayloadBuf(respPayloadLen)
+	var n uint64
+	if err := fd.controlFD.safelyRead(func() error {
+		n, err = fd.impl.Read(payloadBuf[respMetaSize:], req.Offset)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	// Write the response metadata onto the payload buffer. The response contents
+	// already have been written immediately after it.
+	resp.NumBytes = primitive.Uint64(n)
+	resp.NumBytes.MarshalUnsafe(payloadBuf)
+	return respMetaSize + uint32(n), nil
 }
 
 // MkdirAtHandler handles the MkdirAt RPC.
@@ -428,7 +737,7 @@ func MkdirAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, err
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	fd, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
@@ -436,7 +745,29 @@ func MkdirAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 	if !fd.IsDir() {
 		return 0, unix.ENOTDIR
 	}
-	return fd.impl.Mkdir(c, comm, req.Mode, req.UID, req.GID, name)
+	var (
+		childDir     *ControlFD
+		childDirStat linux.Statx
+	)
+	if err := fd.safelyWrite(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		childDir, childDirStat, err = fd.impl.Mkdir(req.Mode, req.UID, req.GID, name)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	resp := MkdirAtResp{
+		ChildDir: Inode{
+			ControlFD: childDir.id,
+			Stat:      childDirStat,
+		},
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // MknodAtHandler handles the MknodAt RPC.
@@ -454,7 +785,7 @@ func MknodAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, err
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	fd, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
@@ -462,7 +793,28 @@ func MknodAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 	if !fd.IsDir() {
 		return 0, unix.ENOTDIR
 	}
-	return fd.impl.Mknod(c, comm, req.Mode, req.UID, req.GID, name, uint32(req.Minor), uint32(req.Major))
+	var (
+		child     *ControlFD
+		childStat linux.Statx
+	)
+	if err := fd.safelyWrite(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		child, childStat, err = fd.impl.Mknod(req.Mode, req.UID, req.GID, name, uint32(req.Minor), uint32(req.Major))
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	resp := MknodAtResp{
+		Child: Inode{
+			ControlFD: child.id,
+			Stat:      childStat,
+		},
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // SymlinkAtHandler handles the SymlinkAt RPC.
@@ -480,7 +832,7 @@ func SymlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 		return 0, err
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	fd, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
@@ -488,7 +840,28 @@ func SymlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 	if !fd.IsDir() {
 		return 0, unix.ENOTDIR
 	}
-	return fd.impl.Symlink(c, comm, name, string(req.Target), req.UID, req.GID)
+	var (
+		symlink     *ControlFD
+		symlinkStat linux.Statx
+	)
+	if err := fd.safelyWrite(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		symlink, symlinkStat, err = fd.impl.Symlink(name, string(req.Target), req.UID, req.GID)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	resp := SymlinkAtResp{
+		Symlink: Inode{
+			ControlFD: symlink.id,
+			Stat:      symlinkStat,
+		},
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // LinkAtHandler handles the LinkAt RPC.
@@ -506,7 +879,7 @@ func LinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 		return 0, err
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	fd, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
@@ -515,11 +888,46 @@ func LinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 		return 0, unix.ENOTDIR
 	}
 
-	targetFD, err := c.LookupControlFD(req.Target)
+	targetFD, err := c.lookupControlFD(req.Target)
 	if err != nil {
 		return 0, err
 	}
-	return targetFD.impl.Link(c, comm, fd.impl, name)
+	defer targetFD.DecRef(nil)
+	if targetFD.IsDir() {
+		// Can not create hard link to directory.
+		return 0, unix.EPERM
+	}
+	var (
+		link     *ControlFD
+		linkStat linux.Statx
+	)
+	if err := fd.safelyWrite(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		// This is a lock ordering issue. Need to provide safe read guarantee for
+		// targetFD. We know targetFD is not a directory while fd is a directory.
+		// So targetFD would either be a descendant of fd or exist elsewhere in the
+		// tree. So locking fd first and targetFD later should not lead to cycles.
+		targetFD.node.opMu.RLock()
+		defer targetFD.node.opMu.RUnlock()
+		if targetFD.node.isDeleted() {
+			return unix.EINVAL
+		}
+		link, linkStat, err = targetFD.impl.Link(fd.impl, name)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	resp := LinkAtResp{
+		Link: Inode{
+			ControlFD: link.id,
+			Stat:      linkStat,
+		},
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // FStatFSHandler handles the FStatFS RPC.
@@ -529,12 +937,21 @@ func FStatFSHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
 	defer fd.DecRef(nil)
-	return fd.impl.StatFS(c, comm)
+	var resp StatFS
+	if err := fd.safelyRead(func() error {
+		resp, err = fd.impl.StatFS()
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // FAllocateHandler handles the FAllocate RPC.
@@ -547,7 +964,7 @@ func FAllocateHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupOpenFD(req.FD)
+	fd, err := c.lookupOpenFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
@@ -555,7 +972,13 @@ func FAllocateHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 	if !fd.writable {
 		return 0, unix.EBADF
 	}
-	return 0, fd.impl.Allocate(c, req.Mode, req.Offset, req.Length)
+
+	return 0, fd.controlFD.safelyWrite(func() error {
+		if fd.controlFD.node.isDeleted() && !c.server.opts.AllocateOnDeleted {
+			return unix.EINVAL
+		}
+		return fd.impl.Allocate(req.Mode, req.Offset, req.Length)
+	})
 }
 
 // ReadLinkAtHandler handles the ReadLinkAt RPC.
@@ -565,7 +988,7 @@ func ReadLinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uin
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
@@ -573,7 +996,29 @@ func ReadLinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uin
 	if !fd.IsSymlink() {
 		return 0, unix.EINVAL
 	}
-	return fd.impl.Readlink(c, comm)
+
+	// We will manually marshal ReadLinkAtResp, which just contains a
+	// SizedString. Let Readlinkat directly write into the payload buffer and
+	// manually write the string size before it.
+	var (
+		linkLen primitive.Uint16
+		n       uint16
+	)
+	respMetaSize := uint32(linkLen.SizeBytes())
+	if fd.safelyRead(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		n, err = fd.impl.Readlink(func(dataLen uint32) []byte {
+			return comm.PayloadBuf(dataLen + respMetaSize)[respMetaSize:]
+		})
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	linkLen = primitive.Uint16(n)
+	linkLen.MarshalUnsafe(comm.PayloadBuf(respMetaSize))
+	return respMetaSize + uint32(n), nil
 }
 
 // FlushHandler handles the Flush RPC.
@@ -583,13 +1028,15 @@ func FlushHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupOpenFD(req.FD)
+	fd, err := c.lookupOpenFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
 	defer fd.DecRef(nil)
 
-	return 0, fd.impl.Flush(c)
+	return 0, fd.controlFD.safelyRead(func() error {
+		return fd.impl.Flush()
+	})
 }
 
 // ConnectHandler handles the Connect RPC.
@@ -599,7 +1046,7 @@ func ConnectHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
@@ -607,7 +1054,124 @@ func ConnectHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 	if !fd.IsSocket() {
 		return 0, unix.ENOTSOCK
 	}
-	return 0, fd.impl.Connect(c, comm, req.SockType)
+	var sock int
+	if err := fd.safelyRead(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		sock, err = fd.impl.Connect(req.SockType)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	comm.DonateFD(sock)
+	return 0, nil
+}
+
+// BindAtHandler handles the BindAt RPC.
+func BindAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
+	var req BindAtReq
+	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
+		return 0, unix.EIO
+	}
+
+	name := string(req.Name)
+	if err := checkSafeName(name); err != nil {
+		return 0, err
+	}
+
+	dir, err := c.lookupControlFD(req.DirFD)
+	if err != nil {
+		return 0, err
+	}
+	defer dir.DecRef(nil)
+
+	if !dir.IsDir() {
+		return 0, unix.ENOTDIR
+	}
+
+	var (
+		childFD       *ControlFD
+		childStat     linux.Statx
+		boundSocketFD *BoundSocketFD
+		hostSocketFD  int
+	)
+	if err := dir.safelyWrite(func() error {
+		if dir.node.isDeleted() {
+			return unix.EINVAL
+		}
+		childFD, childStat, boundSocketFD, hostSocketFD, err = dir.impl.BindAt(name, uint32(req.SockType), req.Mode, req.UID, req.GID)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	comm.DonateFD(hostSocketFD)
+	resp := BindAtResp{
+		Child: Inode{
+			ControlFD: childFD.id,
+			Stat:      childStat,
+		},
+		BoundSocketFD: boundSocketFD.id,
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalUnsafe(comm.PayloadBuf(respLen))
+	return respLen, nil
+}
+
+// ListenHandler handles the Listen RPC.
+func ListenHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
+	var req ListenReq
+	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
+		return 0, unix.EIO
+	}
+	sock, err := c.lookupBoundSocketFD(req.FD)
+	if err != nil {
+		return 0, err
+	}
+	if err := sock.controlFD.safelyRead(func() error {
+		if sock.controlFD.node.isDeleted() {
+			return unix.EINVAL
+		}
+		return sock.impl.Listen(req.Backlog)
+	}); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
+// AcceptHandler handles the Accept RPC.
+func AcceptHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
+	var req AcceptReq
+	if _, ok := req.CheckedUnmarshal(comm.PayloadBuf(payloadLen)); !ok {
+		return 0, unix.EIO
+	}
+	sock, err := c.lookupBoundSocketFD(req.FD)
+	if err != nil {
+		return 0, err
+	}
+	var (
+		newSock  int
+		peerAddr string
+	)
+	if err := sock.controlFD.safelyRead(func() error {
+		if sock.controlFD.node.isDeleted() {
+			return unix.EINVAL
+		}
+		var err error
+		newSock, peerAddr, err = sock.impl.Accept()
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	comm.DonateFD(newSock)
+	resp := AcceptResp{
+		PeerAddr: SizedString(peerAddr),
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalBytes(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // UnlinkAtHandler handles the UnlinkAt RPC.
@@ -625,7 +1189,7 @@ func UnlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		return 0, err
 	}
 
-	fd, err := c.LookupControlFD(req.DirFD)
+	fd, err := c.lookupControlFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
@@ -633,7 +1197,37 @@ func UnlinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 	if !fd.IsDir() {
 		return 0, unix.ENOTDIR
 	}
-	return 0, fd.impl.Unlink(c, name, uint32(req.Flags))
+	return 0, fd.safelyWrite(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+
+		fd.node.childrenMu.Lock()
+		childNode := fd.node.LookupChildLocked(name)
+		fd.node.childrenMu.Unlock()
+		if childNode != nil {
+			// Before we do the unlink itself, we need to ensure that there
+			// are no operations in flight on associated path node.
+			//
+			// This is another case of a lock ordering issue, but since we always
+			// acquire deeper in the hierarchy, we know that we are free of cycles.
+			childNode.opMu.Lock()
+			defer childNode.opMu.Unlock()
+		}
+		if err := fd.impl.Unlink(name, uint32(req.Flags)); err != nil {
+			return err
+		}
+		// Since fd.node.opMu is locked for writing, there will not be a concurrent
+		// creation of a node at that position if childNode == nil. So only remove
+		// node if one existed.
+		if childNode != nil {
+			fd.node.childrenMu.Lock()
+			fd.node.removeChildLocked(name)
+			fd.node.childrenMu.Unlock()
+			childNode.markDeletedRecursive()
+		}
+		return nil
+	})
 }
 
 // RenameAtHandler handles the RenameAt RPC.
@@ -646,82 +1240,92 @@ func RenameAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint3
 		return 0, unix.EIO
 	}
 
+	oldName := string(req.OldName)
+	if err := checkSafeName(oldName); err != nil {
+		return 0, err
+	}
 	newName := string(req.NewName)
 	if err := checkSafeName(newName); err != nil {
 		return 0, err
 	}
 
-	renamed, err := c.LookupControlFD(req.Renamed)
+	oldDir, err := c.lookupControlFD(req.OldDir)
 	if err != nil {
 		return 0, err
 	}
-	defer renamed.DecRef(nil)
-
-	newDir, err := c.LookupControlFD(req.NewDir)
+	defer oldDir.DecRef(nil)
+	newDir, err := c.lookupControlFD(req.NewDir)
 	if err != nil {
 		return 0, err
 	}
 	defer newDir.DecRef(nil)
-	if !newDir.IsDir() {
+
+	if !oldDir.IsDir() || !newDir.IsDir() {
 		return 0, unix.ENOTDIR
 	}
 
 	// Hold RenameMu for writing during rename, this is important.
-	c.server.RenameMu.Lock()
-	defer c.server.RenameMu.Unlock()
-
-	if renamed.parent == nil {
-		// renamed is root.
-		return 0, unix.EBUSY
-	}
-
-	oldParentPath := renamed.parent.FilePathLocked()
-	oldPath := oldParentPath + "/" + renamed.name
-	if newName == renamed.name && oldParentPath == newDir.FilePathLocked() {
-		// Nothing to do.
-		return 0, nil
-	}
-
-	updateControlFD, cleanUp, err := renamed.impl.RenameLocked(c, newDir.impl, newName)
-	if err != nil {
-		return 0, err
-	}
-
-	c.server.forEachMountPoint(func(root *ControlFD) {
-		if !strings.HasPrefix(oldPath, root.name) {
-			return
+	return 0, oldDir.safelyGlobal(func() error {
+		if oldDir.node.isDeleted() || newDir.node.isDeleted() {
+			return unix.EINVAL
 		}
-		pit := fspath.Parse(oldPath[len(root.name):]).Begin
-		root.renameRecursiveLocked(newDir, newName, pit, updateControlFD)
-	})
 
-	if cleanUp != nil {
-		cleanUp()
-	}
-	return 0, nil
+		if oldDir.node == newDir.node && oldName == newName {
+			// Nothing to do.
+			return nil
+		}
+
+		// Attempt the actual rename.
+		if err := oldDir.impl.RenameAt(oldName, newDir.impl, newName); err != nil {
+			return err
+		}
+
+		// Successful, so update the node tree. Note that since we have global
+		// concurrency guarantee here, the node tree can not be modified
+		// concurrently in any way.
+
+		// First see if a file was deleted by being replaced by the rename. If so,
+		// detach it from node tree and mark it as deleted.
+		newDir.node.childrenMu.Lock()
+		replaced := newDir.node.removeChildLocked(newName)
+		newDir.node.childrenMu.Unlock()
+		if replaced != nil {
+			replaced.opMu.Lock()
+			replaced.markDeletedRecursive()
+			replaced.opMu.Unlock()
+		}
+
+		// Now move the renamed node to the right position.
+		oldDir.node.childrenMu.Lock()
+		renamed := oldDir.node.removeChildLocked(oldName)
+		oldDir.node.childrenMu.Unlock()
+		if renamed != nil {
+			renamed.parent.DecRef(nil)
+			renamed.parent = newDir.node
+			renamed.parent.IncRef()
+			renamed.name = newName
+			newDir.node.childrenMu.Lock()
+			newDir.node.insertChildLocked(newName, renamed)
+			newDir.node.childrenMu.Unlock()
+
+			// Now update all FDs under the subtree rooted at renamed.
+			notifyRenameRecursive(renamed)
+		}
+		return nil
+	})
 }
 
-// Precondition: rename mutex must be locked for writing.
-func (fd *ControlFD) renameRecursiveLocked(newDir *ControlFD, newName string, pit fspath.Iterator, updateControlFD func(ControlFDImpl)) {
-	if !pit.Ok() {
-		// fd should be renamed.
-		fd.clearParentLocked()
-		fd.setParentLocked(newDir)
-		fd.name = newName
-		if updateControlFD != nil {
-			updateControlFD(fd.impl)
-		}
-		return
-	}
+func notifyRenameRecursive(n *Node) {
+	n.forEachFD(func(cfd *ControlFD) {
+		cfd.impl.Renamed()
+		cfd.forEachOpenFD(func(ofd *OpenFD) {
+			ofd.impl.Renamed()
+		})
+	})
 
-	cur := pit.String()
-	next := pit.Next()
-	// No need to hold fd.childrenMu because RenameMu is locked for writing.
-	for child := fd.children.Front(); child != nil; child = child.Next() {
-		if child.name == cur {
-			child.renameRecursiveLocked(newDir, newName, next, updateControlFD)
-		}
-	}
+	n.forEachChild(func(child *Node) {
+		notifyRenameRecursive(child)
+	})
 }
 
 // Getdents64Handler handles the Getdents64 RPC.
@@ -731,7 +1335,7 @@ func Getdents64Handler(c *Connection, comm Communicator, payloadLen uint32) (uin
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupOpenFD(req.DirFD)
+	fd, err := c.lookupOpenFD(req.DirFD)
 	if err != nil {
 		return 0, err
 	}
@@ -745,7 +1349,39 @@ func Getdents64Handler(c *Connection, comm Communicator, payloadLen uint32) (uin
 		seek0 = true
 		req.Count = -req.Count
 	}
-	return fd.impl.Getdent64(c, comm, uint32(req.Count), seek0)
+
+	// We will manually marshal the response Getdents64Resp.
+
+	// numDirents is the number of dirents marshalled into the payload.
+	var numDirents primitive.Uint16
+	// The payload starts with numDirents, dirents go right after that.
+	// payloadBufPos represents the position at which to write the next dirent.
+	payloadBufPos := uint32(numDirents.SizeBytes())
+	// Request enough payloadBuf for 10 dirents, we will extend when needed.
+	// unix.Dirent is 280 bytes for amd64.
+	payloadBuf := comm.PayloadBuf(payloadBufPos + 10*unixDirentMaxSize)
+	if err := fd.controlFD.safelyRead(func() error {
+		if fd.controlFD.node.isDeleted() {
+			return unix.EINVAL
+		}
+		return fd.impl.Getdent64(uint32(req.Count), seek0, func(dirent Dirent64) {
+			// Paste the dirent into the payload buffer without having the dirent
+			// escape. Request a larger buffer if needed.
+			if int(payloadBufPos)+dirent.SizeBytes() > len(payloadBuf) {
+				// Ask for 10 large dirents worth of more space.
+				payloadBuf = comm.PayloadBuf(payloadBufPos + 10*unixDirentMaxSize)
+			}
+			dirent.MarshalBytes(payloadBuf[payloadBufPos:])
+			payloadBufPos += uint32(dirent.SizeBytes())
+			numDirents++
+		})
+	}); err != nil {
+		return 0, err
+	}
+
+	// The number of dirents goes at the beginning of the payload.
+	numDirents.MarshalUnsafe(payloadBuf)
+	return payloadBufPos, nil
 }
 
 // FGetXattrHandler handles the FGetXattr RPC.
@@ -755,12 +1391,32 @@ func FGetXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
 	defer fd.DecRef(nil)
-	return fd.impl.GetXattr(c, comm, string(req.Name), uint32(req.BufSize))
+
+	// Manually marshal FGetXattrResp to avoid allocations and copying.
+	// FGetXattrResp simply is a wrapper around SizedString.
+	var valueLen primitive.Uint16
+	respMetaSize := uint32(valueLen.SizeBytes())
+	var n uint16
+	if err := fd.safelyRead(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		n, err = fd.impl.GetXattr(string(req.Name), uint32(req.BufSize), func(dataLen uint32) []byte {
+			return comm.PayloadBuf(dataLen + respMetaSize)[respMetaSize:]
+		})
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	payloadBuf := comm.PayloadBuf(respMetaSize)
+	valueLen = primitive.Uint16(n)
+	valueLen.MarshalBytes(payloadBuf)
+	return respMetaSize + uint32(n), nil
 }
 
 // FSetXattrHandler handles the FSetXattr RPC.
@@ -773,12 +1429,17 @@ func FSetXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
 	defer fd.DecRef(nil)
-	return 0, fd.impl.SetXattr(c, string(req.Name), string(req.Value), uint32(req.Flags))
+	return 0, fd.safelyWrite(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		return fd.impl.SetXattr(string(req.Name), string(req.Value), uint32(req.Flags))
+	})
 }
 
 // FListXattrHandler handles the FListXattr RPC.
@@ -788,12 +1449,25 @@ func FListXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uin
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
 	defer fd.DecRef(nil)
-	return fd.impl.ListXattr(c, comm, req.Size)
+
+	var resp FListXattrResp
+	if fd.safelyRead(func() error {
+		if fd.node.isDeleted() {
+			return unix.EINVAL
+		}
+		resp.Xattrs, err = fd.impl.ListXattr(req.Size)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	respLen := uint32(resp.SizeBytes())
+	resp.MarshalBytes(comm.PayloadBuf(respLen))
+	return respLen, nil
 }
 
 // FRemoveXattrHandler handles the FRemoveXattr RPC.
@@ -806,12 +1480,15 @@ func FRemoveXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (u
 		return 0, unix.EIO
 	}
 
-	fd, err := c.LookupControlFD(req.FD)
+	fd, err := c.lookupControlFD(req.FD)
 	if err != nil {
 		return 0, err
 	}
 	defer fd.DecRef(nil)
-	return 0, fd.impl.RemoveXattr(c, comm, string(req.Name))
+
+	return 0, fd.safelyWrite(func() error {
+		return fd.impl.RemoveXattr(string(req.Name))
+	})
 }
 
 // checkSafeName validates the name and returns nil or returns an error.

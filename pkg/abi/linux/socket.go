@@ -239,6 +239,9 @@ const SockAddrMax = 128
 // +marshal
 type InetAddr [4]byte
 
+// SizeOfInetAddr is the size of InetAddr.
+var SizeOfInetAddr = uint32((*InetAddr)(nil).SizeBytes())
+
 // SockAddrInet is struct sockaddr_in, from uapi/linux/in.h.
 //
 // +marshal
@@ -565,11 +568,17 @@ const SizeOfControlMessageInq = 4
 // SizeOfControlMessageTOS is the size of an IP_TOS control message.
 const SizeOfControlMessageTOS = 1
 
+// SizeOfControlMessageTTL is the size of an IP_TTL control message.
+const SizeOfControlMessageTTL = 4
+
 // SizeOfControlMessageTClass is the size of an IPV6_TCLASS control message.
 const SizeOfControlMessageTClass = 4
 
-// SizeOfControlMessageIPPacketInfo is the size of an IP_PKTINFO
-// control message.
+// SizeOfControlMessageHopLimit is the size of an IPV6_HOPLIMIT control message.
+const SizeOfControlMessageHopLimit = 4
+
+// SizeOfControlMessageIPPacketInfo is the size of an IP_PKTINFO control
+// message.
 const SizeOfControlMessageIPPacketInfo = 12
 
 // SizeOfControlMessageIPv6PacketInfo is the size of a
@@ -586,3 +595,14 @@ const SCM_MAX_FD = 253
 // socket option for querying whether a socket is in a listening
 // state.
 const SO_ACCEPTCON = 1 << 16
+
+// ICMP6Filter represents struct icmp6_filter from linux/icmpv6.h.
+//
+// +marshal
+// +stateify savable
+type ICMP6Filter struct {
+	Filter [8]uint32
+}
+
+// SizeOfICMP6Filter is the size of ICMP6Filter struct.
+var SizeOfICMP6Filter = uint32((*ICMP6Filter)(nil).SizeBytes())

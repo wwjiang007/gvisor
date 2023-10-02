@@ -3,16 +3,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.13 && !go1.19
-// +build go1.13,!go1.19
-
-// //go:linkname directives type-checked by checklinkname. Any other
-// non-linkname assumptions outside the Go 1 compatibility guarantee should
-// have an accompanied vet check or version guard build tag.
-
-// Check type definitions and constants when updating Go version.
-//
-// TODO(b/165820485): add these checks to checklinkname.
+// //go:linkname directives type-checked by checklinkname.
+// Runtime type copies checked by checkoffset.
 
 package sync
 
@@ -21,6 +13,15 @@ import (
 	"reflect"
 	"unsafe"
 )
+
+// Goyield is runtime.goyield, which is similar to runtime.Gosched but only
+// yields the processor to other goroutines already on the processor's
+// runqueue.
+//
+//go:nosplit
+func Goyield() {
+	goyield()
+}
 
 // Gopark is runtime.gopark. Gopark calls unlockf(pointer to runtime.g, lock);
 // if unlockf returns true, Gopark blocks until Goready(pointer to runtime.g)
@@ -35,29 +36,39 @@ func Gopark(unlockf func(uintptr, unsafe.Pointer) bool, lock unsafe.Pointer, rea
 //go:linkname gopark runtime.gopark
 func gopark(unlockf func(uintptr, unsafe.Pointer) bool, lock unsafe.Pointer, reason uint8, traceEv byte, traceskip int)
 
-// Goready is runtime.goready.
+//go:linkname wakep runtime.wakep
+func wakep()
+
+// Wakep is runtime.wakep.
 //
 //go:nosplit
-func Goready(gp uintptr, traceskip int) {
-	goready(gp, traceskip)
+func Wakep() {
+	// This is only supported if we can suppress the wakep called
+	// from  Goready below, which is in certain architectures only.
+	if supportsWakeSuppression {
+		wakep()
+	}
 }
 
 //go:linkname goready runtime.goready
 func goready(gp uintptr, traceskip int)
 
-// Values for the reason argument to gopark, from Go's src/runtime/runtime2.go.
-const (
-	WaitReasonSelect      uint8 = 9
-	WaitReasonChanReceive uint8 = 14
-	WaitReasonSemacquire  uint8 = 18
-)
-
-// Values for the traceEv argument to gopark, from Go's src/runtime/trace.go.
-const (
-	TraceEvGoBlockRecv   byte = 23
-	TraceEvGoBlockSelect byte = 24
-	TraceEvGoBlockSync   byte = 25
-)
+// Goready is runtime.goready.
+//
+// The additional wakep argument controls whether a new thread will be kicked to
+// execute the P. This should be true in most circumstances. However, if the
+// current thread is about to sleep, then this can be false for efficiency.
+//
+//go:nosplit
+func Goready(gp uintptr, traceskip int, wakep bool) {
+	if supportsWakeSuppression && !wakep {
+		preGoReadyWakeSuppression()
+	}
+	goready(gp, traceskip)
+	if supportsWakeSuppression && !wakep {
+		postGoReadyWakeSuppression()
+	}
+}
 
 // Rand32 returns a non-cryptographically-secure random uint32.
 func Rand32() uint32 {
@@ -83,15 +94,15 @@ func RandUintptr() uintptr {
 // MapKeyHasher returns a hash function for pointers of m's key type.
 //
 // Preconditions: m must be a map.
-func MapKeyHasher(m interface{}) func(unsafe.Pointer, uintptr) uintptr {
+func MapKeyHasher(m any) func(unsafe.Pointer, uintptr) uintptr {
 	if rtyp := reflect.TypeOf(m); rtyp.Kind() != reflect.Map {
 		panic(fmt.Sprintf("sync.MapKeyHasher: m is %v, not map", rtyp))
 	}
 	mtyp := *(**maptype)(unsafe.Pointer(&m))
-	return mtyp.hasher
+	return mtyp.Hasher
 }
 
-// maptype is equivalent to the beginning of runtime.maptype.
+// maptype is equivalent to the beginning of internal/abi.MapType.
 type maptype struct {
 	size       uintptr
 	ptrdata    uintptr
@@ -107,7 +118,7 @@ type maptype struct {
 	key        unsafe.Pointer
 	elem       unsafe.Pointer
 	bucket     unsafe.Pointer
-	hasher     func(unsafe.Pointer, uintptr) uintptr
+	Hasher     func(unsafe.Pointer, uintptr) uintptr
 	// more fields
 }
 

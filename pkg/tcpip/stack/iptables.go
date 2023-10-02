@@ -180,7 +180,6 @@ func DefaultTables(clock tcpip.Clock, rand *rand.Rand) *IPTables {
 			clock: clock,
 			rand:  rand,
 		},
-		reaperDone: make(chan struct{}, 1),
 	}
 }
 
@@ -219,6 +218,11 @@ func EmptyNATTable() Table {
 func (it *IPTables) GetTable(id TableID, ipv6 bool) Table {
 	it.mu.RLock()
 	defer it.mu.RUnlock()
+	return it.getTableRLocked(id, ipv6)
+}
+
+// +checklocksread:it.mu
+func (it *IPTables) getTableRLocked(id TableID, ipv6 bool) Table {
 	if ipv6 {
 		return it.v6Tables[id]
 	}
@@ -227,7 +231,7 @@ func (it *IPTables) GetTable(id TableID, ipv6 bool) Table {
 
 // ReplaceTable replaces or inserts table by name. It panics when an invalid id
 // is provided.
-func (it *IPTables) ReplaceTable(id TableID, table Table, ipv6 bool) tcpip.Error {
+func (it *IPTables) ReplaceTable(id TableID, table Table, ipv6 bool) {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 	// If iptables is being enabled, initialize the conntrack table and
@@ -242,7 +246,6 @@ func (it *IPTables) ReplaceTable(id TableID, table Table, ipv6 bool) tcpip.Error
 	} else {
 		it.v4Tables[id] = table
 	}
-	return nil
 }
 
 // A chainVerdict is what a table decides should be done with a packet.
@@ -260,27 +263,79 @@ const (
 	chainReturn
 )
 
+type checkTable struct {
+	fn      checkTableFn
+	tableID TableID
+	table   Table
+}
+
+// shouldSkipOrPopulateTables returns true iff IPTables should be skipped.
+//
+// If IPTables should not be skipped, tables will be updated with the
+// specified table.
+//
+// This is called in the hot path even when iptables are disabled, so we ensure
+// it does not allocate. We check recursively for heap allocations, but not for:
+//   - Stack splitting, which can allocate.
+//   - Calls to interfaces, which can allocate.
+//   - Calls to dynamic functions, which can allocate.
+//
+// +checkescape:hard
+func (it *IPTables) shouldSkipOrPopulateTables(tables []checkTable, pkt PacketBufferPtr) bool {
+	switch pkt.NetworkProtocolNumber {
+	case header.IPv4ProtocolNumber, header.IPv6ProtocolNumber:
+	default:
+		// IPTables only supports IPv4/IPv6.
+		return true
+	}
+
+	it.mu.RLock()
+	defer it.mu.RUnlock()
+
+	if !it.modified {
+		// Many users never configure iptables. Spare them the cost of rule
+		// traversal if rules have never been set.
+		return true
+	}
+
+	for i := range tables {
+		table := &tables[i]
+		table.table = it.getTableRLocked(table.tableID, pkt.NetworkProtocolNumber == header.IPv6ProtocolNumber)
+	}
+	return false
+}
+
 // CheckPrerouting performs the prerouting hook on the packet.
 //
 // Returns true iff the packet may continue traversing the stack; the packet
 // must be dropped if false is returned.
 //
 // Precondition: The packet's network and transport header must be set.
-func (it *IPTables) CheckPrerouting(pkt *PacketBuffer, addressEP AddressableEndpoint, inNicName string) bool {
-	it.mu.RLock()
-	defer it.mu.RUnlock()
+//
+// This is called in the hot path even when iptables are disabled, so we ensure
+// that it does not allocate. Note that called functions (e.g.
+// getConnAndUpdate) can allocate.
+// TODO(b/233951539): checkescape fails on arm sometimes. Fix and re-add.
+func (it *IPTables) CheckPrerouting(pkt PacketBufferPtr, addressEP AddressableEndpoint, inNicName string) bool {
+	tables := [...]checkTable{
+		{
+			fn:      check,
+			tableID: MangleID,
+		},
+		{
+			fn:      checkNAT,
+			tableID: NATID,
+		},
+	}
 
-	if it.shouldSkipRLocked(pkt.NetworkProtocolNumber) {
+	if it.shouldSkipOrPopulateTables(tables[:], pkt) {
 		return true
 	}
 
-	pkt.tuple = it.connections.getConnAndUpdate(pkt)
+	pkt.tuple = it.connections.getConnAndUpdate(pkt, false /* skipChecksumValidation */)
 
-	for _, check := range [...]checkTableFn{
-		it.checkMangleRLocked,
-		it.checkNATRLocked,
-	} {
-		if !check(Prerouting, pkt, nil /* route */, addressEP, inNicName, "" /* outNicName */) {
+	for _, table := range tables {
+		if !table.fn(it, table.table, Prerouting, pkt, nil /* route */, addressEP, inNicName, "" /* outNicName */) {
 			return false
 		}
 	}
@@ -294,19 +349,29 @@ func (it *IPTables) CheckPrerouting(pkt *PacketBuffer, addressEP AddressableEndp
 // must be dropped if false is returned.
 //
 // Precondition: The packet's network and transport header must be set.
-func (it *IPTables) CheckInput(pkt *PacketBuffer, inNicName string) bool {
-	it.mu.RLock()
-	defer it.mu.RUnlock()
+//
+// This is called in the hot path even when iptables are disabled, so we ensure
+// that it does not allocate. Note that called functions (e.g.
+// getConnAndUpdate) can allocate.
+// TODO(b/233951539): checkescape fails on arm sometimes. Fix and re-add.
+func (it *IPTables) CheckInput(pkt PacketBufferPtr, inNicName string) bool {
+	tables := [...]checkTable{
+		{
+			fn:      checkNAT,
+			tableID: NATID,
+		},
+		{
+			fn:      check,
+			tableID: FilterID,
+		},
+	}
 
-	if it.shouldSkipRLocked(pkt.NetworkProtocolNumber) {
+	if it.shouldSkipOrPopulateTables(tables[:], pkt) {
 		return true
 	}
 
-	for _, check := range [...]checkTableFn{
-		it.checkNATRLocked,
-		it.checkFilterRLocked,
-	} {
-		if !check(Input, pkt, nil /* route */, nil /* addressEP */, inNicName, "" /* outNicName */) {
+	for _, table := range tables {
+		if !table.fn(it, table.table, Input, pkt, nil /* route */, nil /* addressEP */, inNicName, "" /* outNicName */) {
 			return false
 		}
 	}
@@ -324,15 +389,30 @@ func (it *IPTables) CheckInput(pkt *PacketBuffer, inNicName string) bool {
 // must be dropped if false is returned.
 //
 // Precondition: The packet's network and transport header must be set.
-func (it *IPTables) CheckForward(pkt *PacketBuffer, inNicName, outNicName string) bool {
-	it.mu.RLock()
-	defer it.mu.RUnlock()
+//
+// This is called in the hot path even when iptables are disabled, so we ensure
+// that it does not allocate. Note that called functions (e.g.
+// getConnAndUpdate) can allocate.
+// TODO(b/233951539): checkescape fails on arm sometimes. Fix and re-add.
+func (it *IPTables) CheckForward(pkt PacketBufferPtr, inNicName, outNicName string) bool {
+	tables := [...]checkTable{
+		{
+			fn:      check,
+			tableID: FilterID,
+		},
+	}
 
-	if it.shouldSkipRLocked(pkt.NetworkProtocolNumber) {
+	if it.shouldSkipOrPopulateTables(tables[:], pkt) {
 		return true
 	}
 
-	return it.checkFilterRLocked(Forward, pkt, nil /* route */, nil /* addressEP */, inNicName, outNicName)
+	for _, table := range tables {
+		if !table.fn(it, table.table, Forward, pkt, nil /* route */, nil /* addressEP */, inNicName, outNicName) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // CheckOutput performs the output hook on the packet.
@@ -341,22 +421,37 @@ func (it *IPTables) CheckForward(pkt *PacketBuffer, inNicName, outNicName string
 // must be dropped if false is returned.
 //
 // Precondition: The packet's network and transport header must be set.
-func (it *IPTables) CheckOutput(pkt *PacketBuffer, r *Route, outNicName string) bool {
-	it.mu.RLock()
-	defer it.mu.RUnlock()
+//
+// This is called in the hot path even when iptables are disabled, so we ensure
+// that it does not allocate. Note that called functions (e.g.
+// getConnAndUpdate) can allocate.
+// TODO(b/233951539): checkescape fails on arm sometimes. Fix and re-add.
+func (it *IPTables) CheckOutput(pkt PacketBufferPtr, r *Route, outNicName string) bool {
+	tables := [...]checkTable{
+		{
+			fn:      check,
+			tableID: MangleID,
+		},
+		{
+			fn:      checkNAT,
+			tableID: NATID,
+		},
+		{
+			fn:      check,
+			tableID: FilterID,
+		},
+	}
 
-	if it.shouldSkipRLocked(pkt.NetworkProtocolNumber) {
+	if it.shouldSkipOrPopulateTables(tables[:], pkt) {
 		return true
 	}
 
-	pkt.tuple = it.connections.getConnAndUpdate(pkt)
+	// We don't need to validate the checksum in the Output path: we can assume
+	// we calculate it correctly, plus checksumming may be deferred due to GSO.
+	pkt.tuple = it.connections.getConnAndUpdate(pkt, true /* skipChecksumValidation */)
 
-	for _, check := range [...]checkTableFn{
-		it.checkMangleRLocked,
-		it.checkNATRLocked,
-		it.checkFilterRLocked,
-	} {
-		if !check(Output, pkt, r, nil /* addressEP */, "" /* inNicName */, outNicName) {
+	for _, table := range tables {
+		if !table.fn(it, table.table, Output, pkt, r, nil /* addressEP */, "" /* inNicName */, outNicName) {
 			return false
 		}
 	}
@@ -370,19 +465,29 @@ func (it *IPTables) CheckOutput(pkt *PacketBuffer, r *Route, outNicName string) 
 // must be dropped if false is returned.
 //
 // Precondition: The packet's network and transport header must be set.
-func (it *IPTables) CheckPostrouting(pkt *PacketBuffer, r *Route, addressEP AddressableEndpoint, outNicName string) bool {
-	it.mu.RLock()
-	defer it.mu.RUnlock()
+//
+// This is called in the hot path even when iptables are disabled, so we ensure
+// that it does not allocate. Note that called functions (e.g.
+// getConnAndUpdate) can allocate.
+// TODO(b/233951539): checkescape fails on arm sometimes. Fix and re-add.
+func (it *IPTables) CheckPostrouting(pkt PacketBufferPtr, r *Route, addressEP AddressableEndpoint, outNicName string) bool {
+	tables := [...]checkTable{
+		{
+			fn:      check,
+			tableID: MangleID,
+		},
+		{
+			fn:      checkNAT,
+			tableID: NATID,
+		},
+	}
 
-	if it.shouldSkipRLocked(pkt.NetworkProtocolNumber) {
+	if it.shouldSkipOrPopulateTables(tables[:], pkt) {
 		return true
 	}
 
-	for _, check := range [...]checkTableFn{
-		it.checkMangleRLocked,
-		it.checkNATRLocked,
-	} {
-		if !check(Postrouting, pkt, r, addressEP, "" /* inNicName */, outNicName) {
+	for _, table := range tables {
+		if !table.fn(it, table.table, Postrouting, pkt, r, addressEP, "" /* inNicName */, outNicName) {
 			return false
 		}
 	}
@@ -394,43 +499,24 @@ func (it *IPTables) CheckPostrouting(pkt *PacketBuffer, r *Route, addressEP Addr
 	return true
 }
 
-// +checklocksread:it.mu
-func (it *IPTables) shouldSkipRLocked(netProto tcpip.NetworkProtocolNumber) bool {
-	switch netProto {
-	case header.IPv4ProtocolNumber, header.IPv6ProtocolNumber:
-	default:
-		// IPTables only supports IPv4/IPv6.
-		return true
-	}
+// Note: this used to omit the *IPTables parameter, but doing so caused
+// unnecessary allocations.
+type checkTableFn func(it *IPTables, table Table, hook Hook, pkt PacketBufferPtr, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool
 
-	// Many users never configure iptables. Spare them the cost of rule
-	// traversal if rules have never been set.
-	return !it.modified
+func checkNAT(it *IPTables, table Table, hook Hook, pkt PacketBufferPtr, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
+	return it.checkNAT(table, hook, pkt, r, addressEP, inNicName, outNicName)
 }
 
-type checkTableFn func(hook Hook, pkt *PacketBuffer, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool
-
-// checkMangleRLocked runs the packet through the mangle table.
+// checkNAT runs the packet through the NAT table.
 //
-// See checkRLocked.
-//
-// +checklocksread:it.mu
-func (it *IPTables) checkMangleRLocked(hook Hook, pkt *PacketBuffer, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
-	return it.checkRLocked(MangleID, hook, pkt, r, addressEP, inNicName, outNicName)
-}
-
-// checkNATRLocked runs the packet through the NAT table.
-//
-// See checkRLocked.
-//
-// +checklocksread:it.mu
-func (it *IPTables) checkNATRLocked(hook Hook, pkt *PacketBuffer, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
+// See check.
+func (it *IPTables) checkNAT(table Table, hook Hook, pkt PacketBufferPtr, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
 	t := pkt.tuple
 	if t != nil && t.conn.handlePacket(pkt, hook, r) {
 		return true
 	}
 
-	if !it.checkRLocked(NATID, hook, pkt, r, addressEP, inNicName, outNicName) {
+	if !it.check(table, hook, pkt, r, addressEP, inNicName, outNicName) {
 		return false
 	}
 
@@ -438,25 +524,23 @@ func (it *IPTables) checkNATRLocked(hook Hook, pkt *PacketBuffer, r *Route, addr
 		return true
 	}
 
-	var dnat bool
-	var natDone *bool
-	switch hook {
-	case Prerouting, Output:
-		dnat = true
-		natDone = &pkt.DNATDone
-	case Input, Postrouting:
-		dnat = false
-		natDone = &pkt.SNATDone
-	case Forward:
-		panic("should not attempt NAT in forwarding")
-	default:
-		panic(fmt.Sprintf("unhandled hook = %d", hook))
-	}
+	dnat, natDone := func() (bool, bool) {
+		switch hook {
+		case Prerouting, Output:
+			return true, pkt.dnatDone
+		case Input, Postrouting:
+			return false, pkt.snatDone
+		case Forward:
+			panic("should not attempt NAT in forwarding")
+		default:
+			panic(fmt.Sprintf("unhandled hook = %d", hook))
+		}
+	}()
 
 	// Make sure the connection is NATed.
 	//
 	// If the packet was already NATed, the connection must be NATed.
-	if !*natDone {
+	if !natDone {
 		t.conn.maybePerformNoopNAT(dnat)
 		_ = t.conn.handlePacket(pkt, hook, r)
 	}
@@ -464,29 +548,16 @@ func (it *IPTables) checkNATRLocked(hook Hook, pkt *PacketBuffer, r *Route, addr
 	return true
 }
 
-// checkFilterRLocked runs the packet through the filter table.
-//
-// See checkRLocked.
-//
-// +checklocksread:it.mu
-func (it *IPTables) checkFilterRLocked(hook Hook, pkt *PacketBuffer, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
-	return it.checkRLocked(FilterID, hook, pkt, r, addressEP, inNicName, outNicName)
+func check(it *IPTables, table Table, hook Hook, pkt PacketBufferPtr, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
+	return it.check(table, hook, pkt, r, addressEP, inNicName, outNicName)
 }
 
-// checkRLocked runs the packet through the rules in the specified table for the
+// check runs the packet through the rules in the specified table for the
 // hook. It returns true if the packet should continue to traverse through the
 // network stack or tables, or false when it must be dropped.
 //
 // Precondition: The packet's network and transport header must be set.
-//
-// +checklocksread:it.mu
-func (it *IPTables) checkRLocked(tableID TableID, hook Hook, pkt *PacketBuffer, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
-	var table Table
-	if pkt.NetworkProtocolNumber == header.IPv6ProtocolNumber {
-		table = it.v6Tables[tableID]
-	} else {
-		table = it.v4Tables[tableID]
-	}
+func (it *IPTables) check(table Table, hook Hook, pkt PacketBufferPtr, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) bool {
 	ruleIdx := table.BuiltinChains[hook]
 	switch verdict := it.checkChain(hook, pkt, table, ruleIdx, r, addressEP, inNicName, outNicName); verdict {
 	// If the table returns Accept, move on to the next table.
@@ -517,7 +588,7 @@ func (it *IPTables) checkRLocked(tableID TableID, hook Hook, pkt *PacketBuffer, 
 // beforeSave is invoked by stateify.
 func (it *IPTables) beforeSave() {
 	// Ensure the reaper exits cleanly.
-	it.reaperDone <- struct{}{}
+	it.reaper.Stop()
 	// Prevent others from modifying the connection table.
 	it.connections.mu.Lock()
 }
@@ -527,72 +598,19 @@ func (it *IPTables) afterLoad() {
 	it.startReaper(reaperDelay)
 }
 
-// startReaper starts a goroutine that wakes up periodically to reap timed out
-// connections.
+// startReaper periodically reaps timed out connections.
 func (it *IPTables) startReaper(interval time.Duration) {
-	go func() { // S/R-SAFE: reaperDone is signalled when iptables is saved.
-		bucket := 0
-		for {
-			select {
-			case <-it.reaperDone:
-				return
-				// TODO(gvisor.dev/issue/5939): do not use the ambient clock.
-			case <-time.After(interval):
-				bucket, interval = it.connections.reapUnused(bucket, interval)
-			}
-		}
-	}()
-}
-
-// CheckOutputPackets performs the output hook on the packets.
-//
-// Returns a map of packets that must be dropped.
-//
-// Precondition:  The packets' network and transport header must be set.
-func (it *IPTables) CheckOutputPackets(pkts PacketBufferList, r *Route, outNicName string) (drop map[*PacketBuffer]struct{}, natPkts map[*PacketBuffer]struct{}) {
-	return checkPackets(pkts, func(pkt *PacketBuffer) bool {
-		return it.CheckOutput(pkt, r, outNicName)
-	}, true /* dnat */)
-}
-
-// CheckPostroutingPackets performs the postrouting hook on the packets.
-//
-// Returns a map of packets that must be dropped.
-//
-// Precondition:  The packets' network and transport header must be set.
-func (it *IPTables) CheckPostroutingPackets(pkts PacketBufferList, r *Route, addressEP AddressableEndpoint, outNicName string) (drop map[*PacketBuffer]struct{}, natPkts map[*PacketBuffer]struct{}) {
-	return checkPackets(pkts, func(pkt *PacketBuffer) bool {
-		return it.CheckPostrouting(pkt, r, addressEP, outNicName)
-	}, false /* dnat */)
-}
-
-func checkPackets(pkts PacketBufferList, f func(*PacketBuffer) bool, dnat bool) (drop map[*PacketBuffer]struct{}, natPkts map[*PacketBuffer]struct{}) {
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		natDone := &pkt.SNATDone
-		if dnat {
-			natDone = &pkt.DNATDone
-		}
-
-		if ok := f(pkt); !ok {
-			if drop == nil {
-				drop = make(map[*PacketBuffer]struct{})
-			}
-			drop[pkt] = struct{}{}
-		}
-		if *natDone {
-			if natPkts == nil {
-				natPkts = make(map[*PacketBuffer]struct{})
-			}
-			natPkts[pkt] = struct{}{}
-		}
-	}
-	return drop, natPkts
+	bucket := 0
+	it.reaper = it.connections.clock.AfterFunc(interval, func() {
+		bucket, interval = it.connections.reapUnused(bucket, interval)
+		it.reaper.Reset(interval)
+	})
 }
 
 // Preconditions:
-// * pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
-// * pkt.NetworkHeader is not nil.
-func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) chainVerdict {
+//   - pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
+//   - pkt.NetworkHeader is not nil.
+func (it *IPTables) checkChain(hook Hook, pkt PacketBufferPtr, table Table, ruleIdx int, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) chainVerdict {
 	// Start from ruleIdx and walk the list of rules until a rule gives us
 	// a verdict.
 	for ruleIdx < len(table.Rules) {
@@ -637,9 +655,12 @@ func (it *IPTables) checkChain(hook Hook, pkt *PacketBuffer, table Table, ruleId
 }
 
 // Preconditions:
+//   - pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
+//   - pkt.NetworkHeader is not nil.
+//
 // * pkt is a IPv4 packet of at least length header.IPv4MinimumSize.
 // * pkt.NetworkHeader is not nil.
-func (it *IPTables) checkRule(hook Hook, pkt *PacketBuffer, table Table, ruleIdx int, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) (RuleVerdict, int) {
+func (it *IPTables) checkRule(hook Hook, pkt PacketBufferPtr, table Table, ruleIdx int, r *Route, addressEP AddressableEndpoint, inNicName, outNicName string) (RuleVerdict, int) {
 	rule := table.Rules[ruleIdx]
 
 	// Check whether the packet matches the IP header filter.
@@ -671,7 +692,7 @@ func (it *IPTables) OriginalDst(epID TransportEndpointID, netProto tcpip.Network
 	it.mu.RLock()
 	defer it.mu.RUnlock()
 	if !it.modified {
-		return "", 0, &tcpip.ErrNotConnected{}
+		return tcpip.Address{}, 0, &tcpip.ErrNotConnected{}
 	}
 	return it.connections.originalDst(epID, netProto, transProto)
 }

@@ -30,7 +30,7 @@ type AcceptTarget struct {
 }
 
 // Action implements Target.Action.
-func (*AcceptTarget) Action(*PacketBuffer, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
+func (*AcceptTarget) Action(PacketBufferPtr, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
 	return RuleAccept, 0
 }
 
@@ -41,8 +41,90 @@ type DropTarget struct {
 }
 
 // Action implements Target.Action.
-func (*DropTarget) Action(*PacketBuffer, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
+func (*DropTarget) Action(PacketBufferPtr, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
 	return RuleDrop, 0
+}
+
+// RejectIPv4WithHandler handles rejecting a packet.
+type RejectIPv4WithHandler interface {
+	// SendRejectionError sends an error packet in response to the packet.
+	SendRejectionError(pkt PacketBufferPtr, rejectWith RejectIPv4WithICMPType, inputHook bool) tcpip.Error
+}
+
+// RejectIPv4WithICMPType indicates the type of ICMP error that should be sent.
+type RejectIPv4WithICMPType int
+
+// The types of errors that may be returned when rejecting IPv4 packets.
+const (
+	_ RejectIPv4WithICMPType = iota
+	RejectIPv4WithICMPNetUnreachable
+	RejectIPv4WithICMPHostUnreachable
+	RejectIPv4WithICMPPortUnreachable
+	RejectIPv4WithICMPNetProhibited
+	RejectIPv4WithICMPHostProhibited
+	RejectIPv4WithICMPAdminProhibited
+)
+
+// RejectIPv4Target drops packets and sends back an error packet in response to the
+// matched packet.
+type RejectIPv4Target struct {
+	Handler    RejectIPv4WithHandler
+	RejectWith RejectIPv4WithICMPType
+}
+
+// Action implements Target.Action.
+func (rt *RejectIPv4Target) Action(pkt PacketBufferPtr, hook Hook, _ *Route, _ AddressableEndpoint) (RuleVerdict, int) {
+	switch hook {
+	case Input, Forward, Output:
+		// There is nothing reasonable for us to do in response to an error here;
+		// we already drop the packet.
+		_ = rt.Handler.SendRejectionError(pkt, rt.RejectWith, hook == Input)
+		return RuleDrop, 0
+	case Prerouting, Postrouting:
+		panic(fmt.Sprintf("%s hook not supported for REDIRECT", hook))
+	default:
+		panic(fmt.Sprintf("unhandled hook = %s", hook))
+	}
+}
+
+// RejectIPv6WithHandler handles rejecting a packet.
+type RejectIPv6WithHandler interface {
+	// SendRejectionError sends an error packet in response to the packet.
+	SendRejectionError(pkt PacketBufferPtr, rejectWith RejectIPv6WithICMPType, forwardingHook bool) tcpip.Error
+}
+
+// RejectIPv6WithICMPType indicates the type of ICMP error that should be sent.
+type RejectIPv6WithICMPType int
+
+// The types of errors that may be returned when rejecting IPv6 packets.
+const (
+	_ RejectIPv6WithICMPType = iota
+	RejectIPv6WithICMPNoRoute
+	RejectIPv6WithICMPAddrUnreachable
+	RejectIPv6WithICMPPortUnreachable
+	RejectIPv6WithICMPAdminProhibited
+)
+
+// RejectIPv6Target drops packets and sends back an error packet in response to the
+// matched packet.
+type RejectIPv6Target struct {
+	Handler    RejectIPv6WithHandler
+	RejectWith RejectIPv6WithICMPType
+}
+
+// Action implements Target.Action.
+func (rt *RejectIPv6Target) Action(pkt PacketBufferPtr, hook Hook, _ *Route, _ AddressableEndpoint) (RuleVerdict, int) {
+	switch hook {
+	case Input, Forward, Output:
+		// There is nothing reasonable for us to do in response to an error here;
+		// we already drop the packet.
+		_ = rt.Handler.SendRejectionError(pkt, rt.RejectWith, hook == Input)
+		return RuleDrop, 0
+	case Prerouting, Postrouting:
+		panic(fmt.Sprintf("%s hook not supported for REDIRECT", hook))
+	default:
+		panic(fmt.Sprintf("unhandled hook = %s", hook))
+	}
 }
 
 // ErrorTarget logs an error and drops the packet. It represents a target that
@@ -53,7 +135,7 @@ type ErrorTarget struct {
 }
 
 // Action implements Target.Action.
-func (*ErrorTarget) Action(*PacketBuffer, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
+func (*ErrorTarget) Action(PacketBufferPtr, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
 	log.Debugf("ErrorTarget triggered.")
 	return RuleDrop, 0
 }
@@ -68,7 +150,7 @@ type UserChainTarget struct {
 }
 
 // Action implements Target.Action.
-func (*UserChainTarget) Action(*PacketBuffer, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
+func (*UserChainTarget) Action(PacketBufferPtr, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
 	panic("UserChainTarget should never be called.")
 }
 
@@ -80,7 +162,7 @@ type ReturnTarget struct {
 }
 
 // Action implements Target.Action.
-func (*ReturnTarget) Action(*PacketBuffer, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
+func (*ReturnTarget) Action(PacketBufferPtr, Hook, *Route, AddressableEndpoint) (RuleVerdict, int) {
 	return RuleReturn, 0
 }
 
@@ -103,7 +185,7 @@ type DNATTarget struct {
 }
 
 // Action implements Target.Action.
-func (rt *DNATTarget) Action(pkt *PacketBuffer, hook Hook, r *Route, addressEP AddressableEndpoint) (RuleVerdict, int) {
+func (rt *DNATTarget) Action(pkt PacketBufferPtr, hook Hook, r *Route, addressEP AddressableEndpoint) (RuleVerdict, int) {
 	// Sanity check.
 	if rt.NetworkProtocol != pkt.NetworkProtocolNumber {
 		panic(fmt.Sprintf(
@@ -137,7 +219,7 @@ type RedirectTarget struct {
 }
 
 // Action implements Target.Action.
-func (rt *RedirectTarget) Action(pkt *PacketBuffer, hook Hook, r *Route, addressEP AddressableEndpoint) (RuleVerdict, int) {
+func (rt *RedirectTarget) Action(pkt PacketBufferPtr, hook Hook, r *Route, addressEP AddressableEndpoint) (RuleVerdict, int) {
 	// Sanity check.
 	if rt.NetworkProtocol != pkt.NetworkProtocolNumber {
 		panic(fmt.Sprintf(
@@ -151,7 +233,7 @@ func (rt *RedirectTarget) Action(pkt *PacketBuffer, hook Hook, r *Route, address
 	switch hook {
 	case Output:
 		if pkt.NetworkProtocolNumber == header.IPv4ProtocolNumber {
-			address = tcpip.Address([]byte{127, 0, 0, 1})
+			address = tcpip.AddrFrom4([4]byte{127, 0, 0, 1})
 		} else {
 			address = header.IPv6Loopback
 		}
@@ -175,49 +257,58 @@ type SNATTarget struct {
 	NetworkProtocol tcpip.NetworkProtocolNumber
 }
 
-func dnatAction(pkt *PacketBuffer, hook Hook, r *Route, port uint16, address tcpip.Address) (RuleVerdict, int) {
-	return natAction(pkt, hook, r, portRange{start: port, size: 1}, address, true /* dnat */)
+func dnatAction(pkt PacketBufferPtr, hook Hook, r *Route, port uint16, address tcpip.Address) (RuleVerdict, int) {
+	return natAction(pkt, hook, r, portOrIdentRange{start: port, size: 1}, address, true /* dnat */)
 }
 
-func snatAction(pkt *PacketBuffer, hook Hook, r *Route, port uint16, address tcpip.Address) (RuleVerdict, int) {
-	ports := portRange{start: port, size: 1}
-	if port == 0 {
-		// As per iptables(8),
-		//
-		//   If no port range is specified, then source ports below 512 will be
-		//   mapped to other ports below 512: those between 512 and 1023 inclusive
-		//   will be mapped to ports below 1024, and other ports will be mapped to
-		//   1024 or above.
-		switch protocol := pkt.TransportProtocolNumber; protocol {
-		case header.UDPProtocolNumber:
-			port = header.UDP(pkt.TransportHeader().View()).SourcePort()
-		case header.TCPProtocolNumber:
-			port = header.TCP(pkt.TransportHeader().View()).SourcePort()
-		default:
-			panic(fmt.Sprintf("unsupported transport protocol = %d", pkt.TransportProtocolNumber))
-		}
+func targetPortRangeForTCPAndUDP(originalSrcPort uint16) portOrIdentRange {
+	// As per iptables(8),
+	//
+	//   If no port range is specified, then source ports below 512 will be
+	//   mapped to other ports below 512: those between 512 and 1023 inclusive
+	//   will be mapped to ports below 1024, and other ports will be mapped to
+	//   1024 or above.
+	switch {
+	case originalSrcPort < 512:
+		return portOrIdentRange{start: 1, size: 511}
+	case originalSrcPort < 1024:
+		return portOrIdentRange{start: 1, size: 1023}
+	default:
+		return portOrIdentRange{start: 1024, size: math.MaxUint16 - 1023}
+	}
+}
 
-		switch {
-		case port < 512:
-			ports = portRange{start: 1, size: 511}
-		case port < 1024:
-			ports = portRange{start: 1, size: 1023}
-		default:
-			ports = portRange{start: 1024, size: math.MaxUint16 - 1023}
+func snatAction(pkt PacketBufferPtr, hook Hook, r *Route, port uint16, address tcpip.Address) (RuleVerdict, int) {
+	portsOrIdents := portOrIdentRange{start: port, size: 1}
+
+	switch pkt.TransportProtocolNumber {
+	case header.UDPProtocolNumber:
+		if port == 0 {
+			portsOrIdents = targetPortRangeForTCPAndUDP(header.UDP(pkt.TransportHeader().Slice()).SourcePort())
 		}
+	case header.TCPProtocolNumber:
+		if port == 0 {
+			portsOrIdents = targetPortRangeForTCPAndUDP(header.TCP(pkt.TransportHeader().Slice()).SourcePort())
+		}
+	case header.ICMPv4ProtocolNumber, header.ICMPv6ProtocolNumber:
+		// Allow NAT-ing to any 16-bit value for ICMP's Ident field to match Linux
+		// behaviour.
+		//
+		// https://github.com/torvalds/linux/blob/58e1100fdc5990b0cc0d4beaf2562a92e621ac7d/net/netfilter/nf_nat_core.c#L391
+		portsOrIdents = portOrIdentRange{start: 0, size: math.MaxUint16 + 1}
 	}
 
-	return natAction(pkt, hook, r, ports, address, false /* dnat */)
+	return natAction(pkt, hook, r, portsOrIdents, address, false /* dnat */)
 }
 
-func natAction(pkt *PacketBuffer, hook Hook, r *Route, ports portRange, address tcpip.Address, dnat bool) (RuleVerdict, int) {
+func natAction(pkt PacketBufferPtr, hook Hook, r *Route, portsOrIdents portOrIdentRange, address tcpip.Address, dnat bool) (RuleVerdict, int) {
 	// Drop the packet if network and transport header are not set.
-	if pkt.NetworkHeader().View().IsEmpty() || pkt.TransportHeader().View().IsEmpty() {
+	if len(pkt.NetworkHeader().Slice()) == 0 || len(pkt.TransportHeader().Slice()) == 0 {
 		return RuleDrop, 0
 	}
 
 	if t := pkt.tuple; t != nil {
-		t.conn.performNAT(pkt, hook, r, ports, address, dnat)
+		t.conn.performNAT(pkt, hook, r, portsOrIdents, address, dnat)
 		return RuleAccept, 0
 	}
 
@@ -225,7 +316,7 @@ func natAction(pkt *PacketBuffer, hook Hook, r *Route, ports portRange, address 
 }
 
 // Action implements Target.Action.
-func (st *SNATTarget) Action(pkt *PacketBuffer, hook Hook, r *Route, _ AddressableEndpoint) (RuleVerdict, int) {
+func (st *SNATTarget) Action(pkt PacketBufferPtr, hook Hook, r *Route, _ AddressableEndpoint) (RuleVerdict, int) {
 	// Sanity check.
 	if st.NetworkProtocol != pkt.NetworkProtocolNumber {
 		panic(fmt.Sprintf(
@@ -252,7 +343,7 @@ type MasqueradeTarget struct {
 }
 
 // Action implements Target.Action.
-func (mt *MasqueradeTarget) Action(pkt *PacketBuffer, hook Hook, r *Route, addressEP AddressableEndpoint) (RuleVerdict, int) {
+func (mt *MasqueradeTarget) Action(pkt PacketBufferPtr, hook Hook, r *Route, addressEP AddressableEndpoint) (RuleVerdict, int) {
 	// Sanity check.
 	if mt.NetworkProtocol != pkt.NetworkProtocolNumber {
 		panic(fmt.Sprintf(
@@ -280,22 +371,60 @@ func (mt *MasqueradeTarget) Action(pkt *PacketBuffer, hook Hook, r *Route, addre
 	return snatAction(pkt, hook, r, 0 /* port */, address)
 }
 
-func rewritePacket(n header.Network, t header.ChecksummableTransport, updateSRCFields, fullChecksum, updatePseudoHeader bool, newPort uint16, newAddr tcpip.Address) {
-	if updateSRCFields {
-		if fullChecksum {
-			t.SetSourcePortWithChecksumUpdate(newPort)
+func rewritePacket(n header.Network, t header.Transport, updateSRCFields, fullChecksum, updatePseudoHeader bool, newPortOrIdent uint16, newAddr tcpip.Address) {
+	switch t := t.(type) {
+	case header.ChecksummableTransport:
+		if updateSRCFields {
+			if fullChecksum {
+				t.SetSourcePortWithChecksumUpdate(newPortOrIdent)
+			} else {
+				t.SetSourcePort(newPortOrIdent)
+			}
 		} else {
-			t.SetSourcePort(newPort)
+			if fullChecksum {
+				t.SetDestinationPortWithChecksumUpdate(newPortOrIdent)
+			} else {
+				t.SetDestinationPort(newPortOrIdent)
+			}
 		}
-	} else {
-		if fullChecksum {
-			t.SetDestinationPortWithChecksumUpdate(newPort)
-		} else {
-			t.SetDestinationPort(newPort)
-		}
-	}
 
-	if updatePseudoHeader {
+		if updatePseudoHeader {
+			var oldAddr tcpip.Address
+			if updateSRCFields {
+				oldAddr = n.SourceAddress()
+			} else {
+				oldAddr = n.DestinationAddress()
+			}
+
+			t.UpdateChecksumPseudoHeaderAddress(oldAddr, newAddr, fullChecksum)
+		}
+	case header.ICMPv4:
+		switch icmpType := t.Type(); icmpType {
+		case header.ICMPv4Echo:
+			if updateSRCFields {
+				t.SetIdentWithChecksumUpdate(newPortOrIdent)
+			}
+		case header.ICMPv4EchoReply:
+			if !updateSRCFields {
+				t.SetIdentWithChecksumUpdate(newPortOrIdent)
+			}
+		default:
+			panic(fmt.Sprintf("unexpected ICMPv4 type = %d", icmpType))
+		}
+	case header.ICMPv6:
+		switch icmpType := t.Type(); icmpType {
+		case header.ICMPv6EchoRequest:
+			if updateSRCFields {
+				t.SetIdentWithChecksumUpdate(newPortOrIdent)
+			}
+		case header.ICMPv6EchoReply:
+			if !updateSRCFields {
+				t.SetIdentWithChecksumUpdate(newPortOrIdent)
+			}
+		default:
+			panic(fmt.Sprintf("unexpected ICMPv4 type = %d", icmpType))
+		}
+
 		var oldAddr tcpip.Address
 		if updateSRCFields {
 			oldAddr = n.SourceAddress()
@@ -303,7 +432,9 @@ func rewritePacket(n header.Network, t header.ChecksummableTransport, updateSRCF
 			oldAddr = n.DestinationAddress()
 		}
 
-		t.UpdateChecksumPseudoHeaderAddress(oldAddr, newAddr, fullChecksum)
+		t.UpdateChecksumPseudoHeaderAddress(oldAddr, newAddr)
+	default:
+		panic(fmt.Sprintf("unhandled transport = %#v", t))
 	}
 
 	if checksummableNetHeader, ok := n.(header.ChecksummableNetwork); ok {

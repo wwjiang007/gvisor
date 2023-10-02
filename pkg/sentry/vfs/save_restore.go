@@ -17,9 +17,8 @@ package vfs
 import (
 	"sync/atomic"
 
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -121,9 +120,10 @@ func (vfs *VirtualFilesystem) loadMounts(mounts []*Mount) {
 // loadKey is called by stateify.
 func (mnt *Mount) loadKey(vd VirtualDentry) { mnt.setKey(vd) }
 
+// afterLoad is called by stateify.
 func (mnt *Mount) afterLoad() {
-	if atomic.LoadInt64(&mnt.refs) != 0 {
-		refsvfs2.Register(mnt)
+	if mnt.refs.Load() != 0 {
+		refs.Register(mnt)
 	}
 }
 
@@ -132,19 +132,4 @@ func (epi *epollInterest) afterLoad() {
 	// Mark all epollInterests as ready after restore so that the next call to
 	// EpollInstance.ReadEvents() rechecks their readiness.
 	epi.waiter.NotifyEvent(waiter.EventMaskFromLinux(epi.mask))
-}
-
-// beforeSave is called by stateify.
-func (fd *FileDescription) beforeSave() {
-	fd.saved = true
-	if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
-		fd.asyncHandler.Unregister(fd)
-	}
-}
-
-// afterLoad is called by stateify.
-func (fd *FileDescription) afterLoad() {
-	if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
-		fd.asyncHandler.Register(fd)
-	}
 }

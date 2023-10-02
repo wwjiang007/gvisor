@@ -34,6 +34,7 @@ type SignalFileDescription struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
+	vfs.NoAsyncEventFD
 
 	// target is the original signal target task.
 	//
@@ -131,8 +132,9 @@ func (sfd *SignalFileDescription) Readiness(mask waiter.EventMask) waiter.EventM
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (sfd *SignalFileDescription) EventRegister(e *waiter.Entry) {
+func (sfd *SignalFileDescription) EventRegister(e *waiter.Entry) error {
 	sfd.queue.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
@@ -145,7 +147,22 @@ func (sfd *SignalFileDescription) NotifyEvent(mask waiter.EventMask) {
 	sfd.queue.Notify(waiter.EventIn) // Always notify data available.
 }
 
+// Epollable implements FileDescriptionImpl.Epollable.
+func (sfd *SignalFileDescription) Epollable() bool {
+	return true
+}
+
 // Release implements vfs.FileDescriptionImpl.Release.
 func (sfd *SignalFileDescription) Release(context.Context) {
 	sfd.target.SignalUnregister(&sfd.entry)
+}
+
+// RegisterFileAsyncHandler implements vfs.FileDescriptionImpl.RegisterFileAsyncHandler.
+func (sfd *SignalFileDescription) RegisterFileAsyncHandler(fd *vfs.FileDescription) error {
+	return sfd.NoAsyncEventFD.RegisterFileAsyncHandler(fd)
+}
+
+// UnregisterFileAsyncHandler implements vfs.FileDescriptionImpl.UnregisterFileAsyncHandler.
+func (sfd *SignalFileDescription) UnregisterFileAsyncHandler(fd *vfs.FileDescription) {
+	sfd.NoAsyncEventFD.UnregisterFileAsyncHandler(fd)
 }

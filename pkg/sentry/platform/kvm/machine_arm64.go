@@ -18,8 +18,8 @@
 package kvm
 
 import (
+	"fmt"
 	"runtime"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -28,11 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
-
-type machineArchState struct {
-	//initialvCPUs is the machine vCPUs which has initialized but not used
-	initialvCPUs map[int]*vCPU
-}
 
 type vCPUArchState struct {
 	// PCIDs is the set of PCIDs for this vCPU.
@@ -67,66 +62,33 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 	})
 }
 
-// Get all read-only physicalRegions.
-func rdonlyRegionsForSetMem() (phyRegions []physicalRegion) {
-	var rdonlyRegions []region
-
-	applyVirtualRegions(func(vr virtualRegion) {
-		if excludeVirtualRegion(vr) {
-			return
-		}
-
-		if !vr.accessType.Write && vr.accessType.Read {
-			rdonlyRegions = append(rdonlyRegions, vr.region)
-		}
-
-		// TODO(gvisor.dev/issue/2686): PROT_NONE should be specially treated.
-		// Workaround: treated as rdonly temporarily.
-		if !vr.accessType.Write && !vr.accessType.Read && !vr.accessType.Execute {
-			rdonlyRegions = append(rdonlyRegions, vr.region)
-		}
-	})
-
-	for _, r := range rdonlyRegions {
-		physical, _, ok := translateToPhysical(r.virtual)
-		if !ok {
-			continue
-		}
-
-		phyRegions = append(phyRegions, physicalRegion{
-			region: region{
-				virtual: r.virtual,
-				length:  r.length,
-			},
-			physical: physical,
-		})
-	}
-
-	return phyRegions
-}
-
 // archPhysicalRegions fills readOnlyGuestRegions and allocates separate
 // physical regions form them.
 func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
-	applyVirtualRegions(func(vr virtualRegion) {
+	rdRegions := []virtualRegion{}
+	if err := applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
 			return // skip region.
 		}
-		if !vr.accessType.Write {
-			readOnlyGuestRegions = append(readOnlyGuestRegions, vr.region)
+		// Skip PROT_NONE mappings. Go-runtime uses them as place
+		// holders for future read-write mappings.
+		if !vr.accessType.Write && vr.accessType.Read {
+			rdRegions = append(rdRegions, vr)
 		}
-	})
-
-	rdRegions := readOnlyGuestRegions[:]
+	}); err != nil {
+		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
+	}
 
 	// Add an unreachable region.
-	rdRegions = append(rdRegions, region{
-		virtual: 0xffffffffffffffff,
-		length:  0,
+	rdRegions = append(rdRegions, virtualRegion{
+		region: region{
+			virtual: 0xffffffffffffffff,
+			length:  0,
+		},
 	})
 
 	var regions []physicalRegion
-	addValidRegion := func(r *physicalRegion, virtual, length uintptr) {
+	addValidRegion := func(r *physicalRegion, virtual, length uintptr, readOnly bool) {
 		if length == 0 {
 			return
 		}
@@ -136,6 +98,7 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 				length:  length,
 			},
 			physical: r.physical + (virtual - r.virtual),
+			readOnly: readOnly,
 		})
 	}
 	i := 0
@@ -143,7 +106,7 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 		start := pr.virtual
 		end := pr.virtual + pr.length
 		for start < end {
-			rdRegion := rdRegions[i]
+			rdRegion := rdRegions[i].region
 			rdStart := rdRegion.virtual
 			rdEnd := rdRegion.virtual + rdRegion.length
 			if rdEnd <= start {
@@ -155,74 +118,17 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 				if end < rdStart {
 					newEnd = end
 				}
-				addValidRegion(&pr, start, newEnd-start)
+				addValidRegion(&pr, start, newEnd-start, false)
 				start = rdStart
 				continue
 			}
 			if rdEnd < end {
-				addValidRegion(&pr, start, rdEnd-start)
+				addValidRegion(&pr, start, rdEnd-start, true)
 				start = rdEnd
 				continue
 			}
-			addValidRegion(&pr, start, end-start)
+			addValidRegion(&pr, start, end-start, start >= rdStart && end <= rdEnd)
 			start = end
-		}
-	}
-
-	return regions
-}
-
-// Get all available physicalRegions.
-func availableRegionsForSetMem() []physicalRegion {
-	var excludedRegions []region
-	applyVirtualRegions(func(vr virtualRegion) {
-		if !vr.accessType.Write {
-			excludedRegions = append(excludedRegions, vr.region)
-		}
-	})
-
-	// Add an unreachable region.
-	excludedRegions = append(excludedRegions, region{
-		virtual: 0xffffffffffffffff,
-		length:  0,
-	})
-
-	var regions []physicalRegion
-	addValidRegion := func(r *physicalRegion, virtual, length uintptr) {
-		if length == 0 {
-			return
-		}
-		regions = append(regions, physicalRegion{
-			region: region{
-				virtual: virtual,
-				length:  length,
-			},
-			physical: r.physical + (virtual - r.virtual),
-		})
-	}
-	i := 0
-	for _, pr := range physicalRegions {
-		start := pr.virtual
-		end := pr.virtual + pr.length
-		for start < end {
-			er := excludedRegions[i]
-			excludeEnd := er.virtual + er.length
-			excludeStart := er.virtual
-			if excludeEnd < start {
-				i++
-				continue
-			}
-			if excludeStart < start {
-				start = excludeEnd
-				i++
-				continue
-			}
-			rend := excludeStart
-			if rend > end {
-				rend = end
-			}
-			addValidRegion(&pr, start, rend-start)
-			start = excludeEnd
 		}
 	}
 
@@ -265,7 +171,7 @@ func isWriteFault(code uint64) bool {
 //go:nosplit
 func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType, error) {
 	bluepill(c) // Probably no-op, but may not be.
-	faultAddr := c.GetFaultAddr()
+	faultAddr := c.FaultAddr()
 	code, user := c.ErrorCode()
 	if !user {
 		// The last fault serviced by this CPU was not a user
@@ -302,7 +208,7 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 // getMaxVCPU get max vCPU number
 func (m *machine) getMaxVCPU() {
 	rmaxVCPUs := runtime.NumCPU()
-	smaxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
+	smaxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
 	// compare the max vcpu number from runtime and syscall, use smaller one.
 	if errno != 0 {
 		m.maxVCPUs = rmaxVCPUs
@@ -313,15 +219,4 @@ func (m *machine) getMaxVCPU() {
 			m.maxVCPUs = int(smaxVCPUs)
 		}
 	}
-}
-
-// getNewVCPU() scan for an available vCPU from initialvCPUs
-func (m *machine) getNewVCPU() *vCPU {
-	for CID, c := range m.initialvCPUs {
-		if atomic.CompareAndSwapUint32(&c.state, vCPUReady, vCPUUser) {
-			delete(m.initialvCPUs, CID)
-			return c
-		}
-	}
-	return nil
 }
