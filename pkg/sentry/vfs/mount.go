@@ -23,6 +23,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -90,9 +91,18 @@ type Mount struct {
 	// isShared indicates this mount has the MS_SHARED propagation type.
 	isShared bool
 
-	// sharedEntry represents an entry in a circular list (ring) of mounts in a
-	// shared peer group.
+	// sharedEntry is an entry in a circular list (ring) of mounts in a shared
+	// peer group.
 	sharedEntry mountEntry
+
+	// followerList is a list of mounts which has this mount as its leader.
+	followerList followerList
+
+	// followerEntry is an entry in a followerList.
+	followerEntry
+
+	// leader is the mount that this mount receives propagation events from.
+	leader *Mount
 
 	// groupID is the ID for this mount's shared peer group. If the mount is not
 	// in a peer group, this is 0.
@@ -108,10 +118,6 @@ type Mount struct {
 	// Mount.EndWrite(). The MSB of writers is set if MS_RDONLY is in effect.
 	// writers is accessed using atomic memory operations.
 	writers atomicbitops.Int64
-
-	// pendingChildren is a list of new child mounts that have not yet been
-	// connected to this mount as the parent.
-	pendingChildren []*Mount
 }
 
 func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *MountNamespace, opts *MountOptions) *Mount {
@@ -143,15 +149,35 @@ func (mnt *Mount) Options() MountOptions {
 	}
 }
 
-func (mnt *Mount) generateOptionalTags() string {
+// MountFlags returns a bit mask that indicates mount options.
+func (mnt *Mount) MountFlags() uint64 {
 	mnt.vfs.lockMounts()
 	defer mnt.vfs.unlockMounts(context.Background())
-	// TODO(b/249777195): Support MS_SLAVE and MS_UNBINDABLE propagation types.
-	var optional string
-	if mnt.isShared {
-		optional = fmt.Sprintf("shared:%d", mnt.groupID)
+	var flags uint64
+	if mnt.Flags.NoExec {
+		flags |= linux.ST_NOEXEC
 	}
-	return optional
+	if mnt.Flags.NoATime {
+		flags |= linux.ST_NOATIME
+	}
+	if mnt.Flags.NoDev {
+		flags |= linux.ST_NODEV
+	}
+	if mnt.Flags.NoSUID {
+		flags |= linux.ST_NOSUID
+	}
+	if mnt.ReadOnly() {
+		flags |= linux.ST_RDONLY
+	}
+	return flags
+}
+
+func (mnt *Mount) isFollower() bool {
+	return mnt.leader != nil
+}
+
+func (mnt *Mount) neverConnected() bool {
+	return mnt.ns == nil
 }
 
 // coveringMount returns a mount that completely covers mnt if it exists and nil
@@ -211,6 +237,65 @@ func (vfs *VirtualFilesystem) MountDisconnected(ctx context.Context, creds *auth
 	return newMount(vfs, fs, root, nil /* mntns */, opts), nil
 }
 
+// attachTreeLocked attaches the mount tree at mnt to vd and propagates the
+// mount to vd.mount's peers and followers. This method is analogous to
+// fs/namespace.c:attach_recursive_mnt() in Linux.
+//
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) attachTreeLocked(ctx context.Context, mnt *Mount, vd VirtualDentry) error {
+	vdCleanup := cleanup.Make(func() {
+		vd.DecRef(ctx)
+	})
+	defer vdCleanup.Clean()
+	// This is equivalent to checking for SB_NOUSER in Linux, which is set on all
+	// anon mounts and sentry-internal filesystems like pipefs.
+	if vd.mount.neverConnected() {
+		return linuxerr.EINVAL
+	}
+	defer func() {
+		vd.mount.ns.pending = 0
+	}()
+	if err := vd.mount.ns.checkMountCount(ctx, mnt); err != nil {
+		return err
+	}
+	if vd.mount.isShared {
+		if err := vfs.allocMountGroupIDs(mnt, true); err != nil {
+			return err
+		}
+	}
+	propMnts, err := vfs.doPropagation(ctx, mnt, vd)
+	cleanup := cleanup.Make(func() {
+		// Checklocks can't understand lock state within closures, so we have to
+		// force.
+		vfs.freeMountGroupIDs(mnt.submountsLocked()) // +checklocksforce
+		for pmnt := range propMnts {
+			if !pmnt.parent().neverConnected() {
+				pmnt.parent().ns.pending -= pmnt.countSubmountsLocked() // +checklocksforce
+			}
+			vfs.abortUncommitedMount(ctx, pmnt) // +checklocksforce
+		}
+	})
+	defer cleanup.Clean()
+	if err != nil {
+		return err
+	}
+	if vd.mount.isShared {
+		for _, m := range mnt.submountsLocked() {
+			m.isShared = true
+		}
+	}
+	vdCleanup.Release()
+	if err := vfs.connectMountAtLocked(ctx, mnt, vd); err != nil {
+		return err
+	}
+	cleanup.Release()
+	vfs.commitChildren(ctx, mnt)
+	for pmnt := range propMnts {
+		vfs.commitMount(ctx, pmnt)
+	}
+	return nil
+}
+
 // ConnectMountAt connects mnt at the path represented by target.
 //
 // Preconditions: mnt must be disconnected.
@@ -223,28 +308,7 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 	}
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
-	// This is equivalent to checking for SB_NOUSER in Linux, which is set on all
-	// anon mounts and sentry-internal filesystems like pipefs.
-	if vd.mount.ns == nil {
-		vfs.delayDecRef(vd)
-		return linuxerr.EINVAL
-	}
-	tree := vfs.preparePropagationTree(mnt, vd)
-	// Check if the new mount + all the propagation mounts puts us over the max.
-	if uint32(len(tree)+1)+vd.mount.ns.mounts > MountMax {
-		// We need to unlock mountMu first because DecRef takes a lock on the
-		// filesystem mutex in some implementations, which can lead to circular
-		// locking.
-		vfs.abortPropagationTree(ctx, tree)
-		vfs.delayDecRef(vd)
-		return linuxerr.ENOSPC
-	}
-	if err := vfs.connectMountAtLocked(ctx, mnt, vd); err != nil {
-		vfs.abortPropagationTree(ctx, tree)
-		return err
-	}
-	vfs.commitPropagationTree(ctx, tree)
-	return nil
+	return vfs.attachTreeLocked(ctx, mnt, vd)
 }
 
 // connectMountAtLocked attaches mnt at vd. This method consumes a reference on
@@ -257,12 +321,35 @@ func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Cr
 //
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) connectMountAtLocked(ctx context.Context, mnt *Mount, vd VirtualDentry) error {
+	mp, err := vfs.lockMountpoint(vd)
+	if err != nil {
+		return err
+	}
+	// TODO(gvisor.dev/issue/1035): Linux requires that either both the mount
+	// point and the mount root are directories, or neither are, and returns
+	// ENOTDIR if this is not the case.
+	mntns := vd.mount.ns
+	vfs.mounts.seq.BeginWrite()
+	vfs.connectLocked(mnt, mp, mntns)
+	vfs.mounts.seq.EndWrite()
+	mp.dentry.mu.Unlock()
+	return nil
+}
+
+// lockMountpoint returns VirtualDentry with a locked Dentry. If vd is a
+// mountpoint, the method returns a VirtualDentry with a locked Dentry that is
+// the top most mount stacked on that Dentry. This method consumes a reference
+// on vd and returns a VirtualDentry with an extra reference. It is analogous to
+// fs/namespace.c:do_lock_mount() in Linux.
+//
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) lockMountpoint(vd VirtualDentry) (VirtualDentry, error) {
 	vd.dentry.mu.Lock()
 	for {
 		if vd.mount.umounted || vd.dentry.dead {
 			vd.dentry.mu.Unlock()
 			vfs.delayDecRef(vd)
-			return linuxerr.ENOENT
+			return VirtualDentry{}, linuxerr.ENOENT
 		}
 		// vd might have been mounted over between vfs.GetDentryAt() and
 		// vfs.mountMu.Lock().
@@ -290,34 +377,26 @@ func (vfs *VirtualFilesystem) connectMountAtLocked(ctx context.Context, mnt *Mou
 		}
 		vd.dentry.mu.Lock()
 	}
-	// TODO(gvisor.dev/issue/1035): Linux requires that either both the mount
-	// point and the mount root are directories, or neither are, and returns
-	// ENOTDIR if this is not the case.
-	mntns := vd.mount.ns
-	vfs.mounts.seq.BeginWrite()
-	vfs.connectLocked(mnt, vd, mntns)
-	vfs.mounts.seq.EndWrite()
-	vd.dentry.mu.Unlock()
-	return nil
+	return vd, nil
 }
 
 // CloneMountAt returns a new mount with the same fs, specified root and
-// mount options. If mnt's propagation type is shared the new mount is
-// automatically made a peer of mnt. If mount options are nil, mnt's
-// options are copied.
-func (vfs *VirtualFilesystem) CloneMountAt(mnt *Mount, root *Dentry, mopts *MountOptions) *Mount {
+// mount options.  If mount options are nil, mnt's options are copied. The clone
+// is added to mnt's peer group if mnt is shared. If not the clone is in a
+// shared peer group by itself.
+func (vfs *VirtualFilesystem) CloneMountAt(mnt *Mount, root *Dentry, mopts *MountOptions) (*Mount, error) {
 	vfs.lockMounts()
 	defer vfs.unlockMounts(context.Background())
-	clone := vfs.cloneMount(mnt, root, mopts)
-	return clone
+	return vfs.cloneMount(mnt, root, mopts, makeSharedClone)
 }
 
 // cloneMount returns a new mount with mnt.fs as the filesystem and root as the
-// root. The returned mount has an extra reference.
+// root, with a propagation type specified by cloneType. The returned mount has
+// an extra reference. If mopts is nil, use the options found in mnt.
+// This method is analogous to fs/namespace.c:clone_mnt() in Linux.
 //
 // +checklocks:vfs.mountMu
-// +checklocksalias:mnt.vfs.mountMu=vfs.mountMu
-func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountOptions) *Mount {
+func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountOptions, cloneType int) (*Mount, error) {
 	opts := mopts
 	if opts == nil {
 		opts = &MountOptions{
@@ -326,10 +405,39 @@ func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountO
 		}
 	}
 	clone := vfs.NewDisconnectedMount(mnt.fs, root, opts)
-	if mnt.isShared {
-		vfs.addPeer(mnt, clone)
+	if cloneType&(makeFollowerClone|makePrivateClone|sharedToFollowerClone) != 0 {
+		clone.groupID = 0
+	} else {
+		clone.groupID = mnt.groupID
 	}
-	return clone
+	if cloneType&makeSharedClone != 0 && clone.groupID == 0 {
+		gid, err := vfs.allocateGroupID()
+		if err != nil {
+			vfs.delayDecRef(clone)
+			return nil, linuxerr.ENOSPC
+		}
+		clone.groupID = gid
+	}
+	clone.isShared = mnt.isShared
+	if cloneType&makeFollowerClone != 0 || (cloneType&sharedToFollowerClone != 0 && mnt.isShared) {
+		mnt.followerList.PushFront(clone)
+		clone.leader = mnt
+		clone.isShared = false
+	} else if cloneType&makePrivateClone == 0 {
+		if cloneType&makeSharedClone != 0 || mnt.isShared {
+			mnt.sharedEntry.Add(&clone.sharedEntry)
+		}
+		if mnt.isFollower() {
+			mnt.leader.followerList.InsertAfter(mnt, clone)
+		}
+		clone.leader = mnt.leader
+	} else {
+		clone.isShared = false
+	}
+	if cloneType&makeSharedClone != 0 {
+		clone.isShared = true
+	}
+	return clone, nil
 }
 
 type cloneTreeNode struct {
@@ -338,26 +446,48 @@ type cloneTreeNode struct {
 }
 
 // cloneMountTree creates a copy of mnt's tree with the specified root
-// dentry at root. The new descendents are added to mnt's pending mount list.
+// dentry at root. The new descendants are added to mnt's children list but are
+// not connected with call to connectLocked.
+// `cloneFunc` is a callback that is executed for each cloned mount.
+// This method is analogous to fs/namespace.c:copy_tree() in Linux.
 //
 // +checklocks:vfs.mountMu
-func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, root *Dentry) (*Mount, error) {
-	clone := vfs.cloneMount(mnt, root, nil)
+func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, root *Dentry, cloneType int, cloneFunc func(ctx context.Context, oldmnt, newMnt *Mount)) (*Mount, error) {
+	clone, err := vfs.cloneMount(mnt, root, nil, cloneType)
+	if err != nil {
+		return nil, err
+	}
+	if cloneFunc != nil {
+		cloneFunc(ctx, mnt, clone)
+	}
 	queue := []cloneTreeNode{{mnt, clone}}
 	for len(queue) != 0 {
 		p := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
 		for c := range p.prevMount.children {
-			m := vfs.cloneMount(c, c.root, nil)
+			if mp := c.getKey(); p.prevMount == mnt && !mp.mount.fs.Impl().IsDescendant(VirtualDentry{mnt, root}, mp) {
+				continue
+			}
+			m, err := vfs.cloneMount(c, c.root, nil, cloneType)
+			if err != nil {
+				vfs.abortUncommitedMount(ctx, clone)
+				return nil, err
+			}
 			mp := VirtualDentry{
 				mount:  p.parentMount,
 				dentry: c.point(),
 			}
 			mp.IncRef()
 			m.setKey(mp)
-			p.parentMount.pendingChildren = append(p.parentMount.pendingChildren, m)
+			if p.parentMount.children == nil {
+				p.parentMount.children = make(map[*Mount]struct{})
+			}
+			p.parentMount.children[m] = struct{}{}
 			if len(c.children) != 0 {
 				queue = append(queue, cloneTreeNode{c, m})
+			}
+			if cloneFunc != nil {
+				cloneFunc(ctx, c, m)
 			}
 		}
 	}
@@ -367,44 +497,35 @@ func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, ro
 // BindAt creates a clone of the source path's parent mount and mounts it at
 // the target path. The new mount's root dentry is one pointed to by the source
 // path.
-//
-// TODO(b/249121230): Support recursive bind mounting.
-func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credentials, source, target *PathOperation) (*Mount, error) {
+func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credentials, source, target *PathOperation, recursive bool) error {
 	sourceVd, err := vfs.GetDentryAt(ctx, creds, source, &GetDentryOptions{})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer sourceVd.DecRef(ctx)
 	targetVd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{})
 	if err != nil {
-		return nil, err
+		return err
 	}
+
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
-	// This is equivalent to checking for SB_NOUSER in Linux, which is set on all
-	// anon mounts.
-	if targetVd.mount.ns == nil {
-		vfs.delayDecRef(targetVd)
-		return nil, linuxerr.EINVAL
+	var clone *Mount
+	if recursive {
+		clone, err = vfs.cloneMountTree(ctx, sourceVd.mount, sourceVd.dentry, 0, nil)
+	} else {
+		clone, err = vfs.cloneMount(sourceVd.mount, sourceVd.dentry, nil, 0)
 	}
-
-	clone := vfs.cloneMount(sourceVd.mount, sourceVd.dentry, nil)
+	if err != nil {
+		vfs.delayDecRef(targetVd)
+		return err
+	}
 	vfs.delayDecRef(clone)
-	tree := vfs.preparePropagationTree(clone, targetVd)
-	if uint32(1+len(tree))+targetVd.mount.ns.mounts > MountMax {
-		vfs.setPropagation(clone, linux.MS_PRIVATE)
-		vfs.abortPropagationTree(ctx, tree)
-		vfs.delayDecRef(targetVd)
-		return nil, linuxerr.ENOSPC
+	if err := vfs.attachTreeLocked(ctx, clone, targetVd); err != nil {
+		vfs.abortUncomittedChildren(ctx, clone)
+		return err
 	}
-
-	if err := vfs.connectMountAtLocked(ctx, clone, targetVd); err != nil {
-		vfs.setPropagation(clone, linux.MS_PRIVATE)
-		vfs.abortPropagationTree(ctx, tree)
-		return nil, err
-	}
-	vfs.commitPropagationTree(ctx, tree)
-	return clone, nil
+	return nil
 }
 
 // MountAt creates and mounts a Filesystem configured by the given arguments.
@@ -477,51 +598,51 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 		}
 	}
 
-	umountTree := []*Mount{vd.mount}
-	parent, mountpoint := vd.mount.parent(), vd.mount.point()
-	if parent != nil && parent.isShared {
-		for peer := parent.sharedEntry.Next(); peer != parent; peer = peer.sharedEntry.Next() {
-			umountMnt := vfs.mounts.Lookup(peer, mountpoint)
-			// From https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt:
-			// If any peer has some child mounts, then that mount is not unmounted,
-			// but all other mounts are unmounted.
-			if umountMnt == nil {
-				continue
-			}
-			if len(umountMnt.children) == 0 || umountMnt.coveringMount() != nil {
-				umountTree = append(umountTree, umountMnt)
-			}
-		}
+	if opts.Flags&linux.MNT_DETACH == 0 && vfs.arePropMountsBusy(vd.mount) {
+		return linuxerr.EBUSY
 	}
 
 	// TODO(gvisor.dev/issue/1035): Linux special-cases umount of the caller's
 	// root, which we don't implement yet (we'll just fail it since the caller
 	// holds a reference on it).
 
-	vfs.mounts.seq.BeginWrite()
-	if opts.Flags&linux.MNT_DETACH == 0 {
-		if len(vd.mount.children) != 0 {
-			vfs.mounts.seq.EndWrite()
-			return linuxerr.EBUSY
-		}
-		// We are holding a reference on vd.mount.
-		expectedRefs := int64(1)
-		if !vd.mount.umounted {
-			expectedRefs = 2
-		}
-		if vd.mount.refs.Load()&^math.MinInt64 != expectedRefs { // mask out MSB
-			vfs.mounts.seq.EndWrite()
-			return linuxerr.EBUSY
+	propMounts := []*Mount{vd.mount}
+	if vd.mount.parent() != nil {
+		for m := nextPropMount(vd.mount.parent(), vd.mount.parent()); m != nil; m = nextPropMount(m, vd.mount.parent()) {
+			child := vfs.mounts.Lookup(m, vd.mount.point())
+			if child == nil {
+				continue
+			}
+			if len(child.children) != 0 && child.coveringMount() == nil {
+				continue
+			}
+			propMounts = append(propMounts, child)
 		}
 	}
-	for _, mnt := range umountTree {
-		vfs.umountRecursiveLocked(mnt, &umountRecursiveOptions{
+	vfs.mounts.seq.BeginWrite()
+	for _, m := range propMounts {
+		vfs.umountRecursiveLocked(m, &umountRecursiveOptions{
 			eager:               opts.Flags&linux.MNT_DETACH == 0,
 			disconnectHierarchy: true,
 		})
 	}
 	vfs.mounts.seq.EndWrite()
 	return nil
+}
+
+// mountHasExpectedRefs checks that mnt has the correct number of references
+// before a umount. It is analogous to fs/pnode.c:do_refcount_check().
+//
+// +checklocks:vfs.mountMu
+func (vfs *VirtualFilesystem) mountHasExpectedRefs(mnt *Mount) bool {
+	expectedRefs := int64(1)
+	if !mnt.umounted {
+		expectedRefs++
+	}
+	if mnt.coveringMount() != nil {
+		expectedRefs++
+	}
+	return mnt.refs.Load()&^math.MinInt64 == expectedRefs // mask out MSB
 }
 
 // +stateify savable
@@ -567,9 +688,7 @@ func (vfs *VirtualFilesystem) umountRecursiveLocked(mnt *Mount, opts *umountRecu
 		if parent := mnt.parent(); parent != nil && (opts.disconnectHierarchy || !parent.umounted) {
 			vfs.delayDecRef(vfs.disconnectLocked(mnt))
 		}
-		if mnt.isShared {
-			vfs.setPropagation(mnt, linux.MS_PRIVATE)
-		}
+		vfs.setPropagation(mnt, linux.MS_PRIVATE)
 	}
 	if opts.eager {
 		for {
@@ -888,7 +1007,7 @@ func (vfs *VirtualFilesystem) PivotRoot(ctx context.Context, creds *auth.Credent
 retry:
 	epoch := vfs.mounts.seq.BeginRead()
 	// Neither new_root nor put_old can be on the same mount as the current
-	//root mount.
+	// root mount.
 	if newRootVd.mount == rootVd.mount || putOldVd.mount == rootVd.mount {
 		return linuxerr.EBUSY
 	}
@@ -931,8 +1050,17 @@ retry:
 		return linuxerr.EINVAL
 	}
 
+	putOldVd.IncRef()
+	putOldMp, err := vfs.lockMountpoint(putOldVd)
+	if err != nil {
+		vfs.delayDecRef(putOldMp)
+		vfs.unlockMounts(ctx)
+		return err
+	}
+
 	if !vfs.mounts.seq.BeginWriteOk(epoch) {
 		// Checks above raced with a mount change.
+		putOldMp.dentry.mu.Unlock()
 		vfs.unlockMounts(ctx)
 		goto retry
 	}
@@ -941,10 +1069,8 @@ retry:
 	vfs.delayDecRef(mp)
 	rootMp := vfs.disconnectLocked(rootVd.mount)
 
-	putOldVd.IncRef()
-	putOldVd.dentry.mu.Lock()
-	vfs.connectLocked(rootVd.mount, putOldVd, ns)
-	putOldVd.dentry.mu.Unlock()
+	vfs.connectLocked(rootVd.mount, putOldMp, ns)
+	putOldMp.dentry.mu.Unlock()
 
 	rootMp.dentry.mu.Lock()
 	vfs.connectLocked(newRootVd.mount, rootMp, ns)
@@ -1019,6 +1145,18 @@ func (mnt *Mount) submountsLocked() []*Mount {
 	mounts := []*Mount{mnt}
 	for m := range mnt.children {
 		mounts = append(mounts, m.submountsLocked()...)
+	}
+	return mounts
+}
+
+// countSubmountsLocked returns mnt's total number of descendants including
+// uncommitted descendants.
+//
+// Precondition: mnt.vfs.mountMu must be held.
+func (mnt *Mount) countSubmountsLocked() uint32 {
+	mounts := uint32(1)
+	for m := range mnt.children {
+		mounts += m.countSubmountsLocked()
 	}
 	return mounts
 }
@@ -1199,7 +1337,7 @@ func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRoo
 		fmt.Fprintf(buf, "%s ", opts)
 
 		// (7) Optional fields: zero or more fields of the form "tag[:value]".
-		fmt.Fprintf(buf, "%s ", mnt.generateOptionalTags())
+		fmt.Fprintf(buf, "%s", vfs.generateOptionalTags(ctx, mnt, taskRootDir))
 		// (8) Separator: the end of the optional fields is marked by a single hyphen.
 		fmt.Fprintf(buf, "- ")
 
@@ -1255,25 +1393,30 @@ func superBlockOpts(mountPath string, mnt *Mount) string {
 	return opts
 }
 
-// allocateGroupID returns a new mount group id if one is available, and
-// error otherwise. If the group ID bitmap is full, double the size of the
-// bitmap before allocating the new group id.
-//
-// +checklocks:vfs.mountMu
-func (vfs *VirtualFilesystem) allocateGroupID() (uint32, error) {
-	groupID, err := vfs.groupIDBitmap.FirstZero(1)
-	if err != nil {
-		if err := vfs.groupIDBitmap.Grow(uint32(vfs.groupIDBitmap.Size())); err != nil {
-			return 0, err
+func (vfs *VirtualFilesystem) generateOptionalTags(ctx context.Context, mnt *Mount, root VirtualDentry) string {
+	vfs.lockMounts()
+	defer vfs.unlockMounts(ctx)
+	// TODO(b/249777195): Support MS_UNBINDABLE propagation type.
+	var optionalSb strings.Builder
+	if mnt.isShared {
+		optionalSb.WriteString(fmt.Sprintf("shared:%d ", mnt.groupID))
+	}
+	if mnt.isFollower() {
+		// Per man mount_namespaces(7), propagate_from should not be
+		// included in optional tags if the leader "is the immediate leader of the
+		// mount, or if there is no dominant peer group under the same root". A
+		// dominant peer group is the nearest reachable mount in the leader/follower
+		// chain.
+		optionalSb.WriteString(fmt.Sprintf("master:%d ", mnt.leader.groupID))
+		var dominant *Mount
+		for m := mnt.leader; m != nil; m = m.leader {
+			if dominant = vfs.peerUnderRoot(ctx, m, mnt.ns, root); dominant != nil {
+				break
+			}
+		}
+		if dominant != nil && dominant != mnt.leader {
+			optionalSb.WriteString(fmt.Sprintf("propagate_from:%d ", dominant.groupID))
 		}
 	}
-	vfs.groupIDBitmap.Add(groupID)
-	return groupID, nil
-}
-
-// freeGroupID marks a groupID as available for reuse.
-//
-// +checklocks:vfs.mountMu
-func (vfs *VirtualFilesystem) freeGroupID(id uint32) {
-	vfs.groupIDBitmap.Remove(id)
+	return optionalSb.String()
 }

@@ -25,25 +25,25 @@ import (
 // KVM platform.
 func (k *KVM) archSyscallFilters() seccomp.SyscallRules {
 	return seccomp.SyscallRules{
-		unix.SYS_ARCH_PRCTL: {
-			{
+		unix.SYS_ARCH_PRCTL: seccomp.Or{
+			seccomp.PerArg{
 				seccomp.EqualTo(linux.ARCH_GET_FS),
 			},
-			{
+			seccomp.PerArg{
 				seccomp.EqualTo(linux.ARCH_GET_GS),
 			},
 		},
-		unix.SYS_IOCTL: []seccomp.Rule{
-			{
-				seccomp.MatchAny{},
+		unix.SYS_IOCTL: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.AnyValue{},
 				seccomp.EqualTo(KVM_INTERRUPT),
 			},
-			{
-				seccomp.MatchAny{},
+			seccomp.PerArg{
+				seccomp.AnyValue{},
 				seccomp.EqualTo(KVM_NMI),
 			},
-			{
-				seccomp.MatchAny{},
+			seccomp.PerArg{
+				seccomp.AnyValue{},
 				seccomp.EqualTo(KVM_GET_REGS),
 			},
 		},
