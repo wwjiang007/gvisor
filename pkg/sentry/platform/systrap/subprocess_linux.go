@@ -54,7 +54,7 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 	rules := []seccomp.RuleSet{}
 	if defaultAction != linux.SECCOMP_RET_ALLOW {
 		ruleSet := seccomp.RuleSet{
-			Rules: seccomp.SyscallRules{
+			Rules: seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 				unix.SYS_CLONE: seccomp.Or{
 					// Allow creation of new subprocesses (used by the master).
 					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.SIGKILL)},
@@ -124,13 +124,13 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 					seccomp.EqualTo(0),
 					seccomp.AnyValue{},
 				},
-			},
+			}),
 			Action: linux.SECCOMP_RET_ALLOW,
 		}
 		rules = append(rules, ruleSet)
 		rules = appendArchSeccompRules(rules)
 	}
-	instrs, err := seccomp.BuildProgram(rules, defaultAction, defaultAction)
+	instrs, _, err := seccomp.BuildProgram(rules, defaultAction, defaultAction)
 	if err != nil {
 		return nil, err
 	}

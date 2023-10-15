@@ -19,6 +19,7 @@ package seccomp
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
@@ -65,9 +66,9 @@ func Install(rules SyscallRules, denyRules SyscallRules) error {
 	// below to get a panic stack trace when there is a violation.
 	// defaultAction = linux.BPFAction(linux.SECCOMP_RET_TRAP)
 
-	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
+	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", rules.Size(), defaultAction)
 
-	instrs, err := BuildProgram([]RuleSet{
+	instrs, _, err := BuildProgram([]RuleSet{
 		{
 			Rules:  denyRules,
 			Action: defaultAction,
@@ -269,9 +270,25 @@ func (l *labelSet) Push(labelSuffix string, newRuleMatch, newRuleMismatch label)
 	}
 }
 
+// BuildStats contains information about seccomp program generation.
+type BuildStats struct {
+	// SizeBeforeOptimizations and SizeAfterOptimizations correspond to the
+	// number of instructions in the program before vs after optimization.
+	SizeBeforeOptimizations, SizeAfterOptimizations int
+
+	// BuildDuration is the amount of time it took to build the program (before
+	// BPF bytecode optimizations).
+	BuildDuration time.Duration
+
+	// OptimizeDuration is the amount of time it took to run BPF bytecode
+	// optimizations.
+	OptimizeDuration time.Duration
+}
+
 // BuildProgram builds a BPF program from the given map of actions to matching
 // SyscallRules. The single generated program covers all provided RuleSets.
-func BuildProgram(rules []RuleSet, defaultAction, badArchAction linux.BPFAction) ([]bpf.Instruction, error) {
+func BuildProgram(rules []RuleSet, defaultAction, badArchAction linux.BPFAction) ([]bpf.Instruction, BuildStats, error) {
+	start := time.Now()
 	program := &syscallProgram{
 		program: bpf.NewProgramBuilder(),
 	}
@@ -284,7 +301,7 @@ func BuildProgram(rules []RuleSet, defaultAction, badArchAction linux.BPFAction)
 	program.Stmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetArch)
 	program.IfNot(bpf.Jmp|bpf.Jeq|bpf.K, LINUX_AUDIT_ARCH, badArchLabel)
 	if err := buildIndex(rules, program); err != nil {
-		return nil, err
+		return nil, BuildStats{}, err
 	}
 
 	// Default label if none of the rules matched:
@@ -297,13 +314,20 @@ func BuildProgram(rules []RuleSet, defaultAction, badArchAction linux.BPFAction)
 
 	insns, err := program.program.Instructions()
 	if err != nil {
-		return insns, err
+		return nil, BuildStats{}, err
 	}
 	beforeOpt := len(insns)
+	buildDuration := time.Since(start)
 	insns = bpf.Optimize(insns)
+	optimizeDuration := time.Since(start) - buildDuration
 	afterOpt := len(insns)
-	log.Debugf("Seccomp program optimized from %d to %d instructions", beforeOpt, afterOpt)
-	return insns, nil
+	log.Debugf("Seccomp program optimized from %d to %d instructions; took %v to build and %v to optimize", beforeOpt, afterOpt, buildDuration, optimizeDuration)
+	return insns, BuildStats{
+		SizeBeforeOptimizations: beforeOpt,
+		SizeAfterOptimizations:  afterOpt,
+		BuildDuration:           buildDuration,
+		OptimizeDuration:        optimizeDuration,
+	}, nil
 }
 
 // buildIndex builds a BST to quickly search through all syscalls.
@@ -318,7 +342,7 @@ func buildIndex(rules []RuleSet, program *syscallProgram) error {
 	// with different actions. The matchers are evaluated linearly.
 	requiredSyscalls := make(map[uintptr]struct{})
 	for _, rs := range rules {
-		for sysno := range rs.Rules {
+		for sysno := range rs.Rules.rules {
 			requiredSyscalls[sysno] = struct{}{}
 		}
 	}
@@ -330,8 +354,8 @@ func buildIndex(rules []RuleSet, program *syscallProgram) error {
 	for _, sysno := range syscalls {
 		for _, rs := range rules {
 			// Print only if there is a corresponding set of rules.
-			if _, ok := rs.Rules[sysno]; ok {
-				log.Debugf("syscall filter %v: %s => 0x%x", SyscallName(sysno), rs.Rules[sysno], rs.Action)
+			if r, ok := rs.Rules.rules[sysno]; ok {
+				log.Debugf("syscall filter %v: %s => 0x%x", SyscallName(sysno), r, rs.Action)
 			}
 		}
 	}
@@ -404,7 +428,7 @@ func buildBSTProgram(n *node, rules []RuleSet, program *syscallProgram) error {
 	program.Label(checkArgsLabel)
 
 	for ruleSetIdx, rs := range rules {
-		rule, ok := rs.Rules[sysno]
+		rule, ok := rs.Rules.rules[sysno]
 		if !ok {
 			continue
 		}

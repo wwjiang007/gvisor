@@ -51,7 +51,7 @@ func BuildProgram(s *specs.LinuxSeccomp) (bpf.Program, error) {
 		return bpf.Program{}, fmt.Errorf("invalid seccomp rules: %w", err)
 	}
 
-	instrs, err := seccomp.BuildProgram(ruleset, defaultAction, killThreadAction)
+	instrs, _, err := seccomp.BuildProgram(ruleset, defaultAction, killThreadAction)
 	if err != nil {
 		return bpf.Program{}, fmt.Errorf("building seccomp program: %w", err)
 	}
@@ -136,7 +136,7 @@ func convertRules(s *specs.LinuxSeccomp) ([]seccomp.RuleSet, error) {
 				continue
 			}
 
-			sysRules.AddRule(uintptr(syscallNo), rule)
+			sysRules.Add(uintptr(syscallNo), rule)
 		}
 
 		ruleset = append(ruleset, seccomp.RuleSet{

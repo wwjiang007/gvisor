@@ -17,8 +17,11 @@
 
 package checksum
 
+// calculateChecksumAMD64 is defined in assembly.
+func calculateChecksumAMD64(buf []byte, odd bool, initial uint16) (uint16, bool)
+
 // Note: odd indicates whether initial is a partial checksum over an odd number
 // of bytes.
-//
-// calculateChecksum is defined in assembly.
-func calculateChecksum(buf []byte, odd bool, initial uint16) (uint16, bool)
+func calculateChecksum(buf []byte, odd bool, initial uint16) (uint16, bool) {
+	return calculateChecksumAMD64(buf, odd, initial)
+}

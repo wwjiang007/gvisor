@@ -25,7 +25,7 @@ import (
 func Filters() seccomp.SyscallRules {
 	nonNegativeFD := seccomp.NonNegativeFDCheck()
 	notIocSizeMask := ^(((uintptr(1) << linux.IOC_SIZEBITS) - 1) << linux.IOC_SIZESHIFT) // for ioctls taking arbitrary size
-	return seccomp.SyscallRules{
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_OPENAT: seccomp.PerArg{
 			// All paths that we openat() are absolute, so we pass a dirfd
 			// of -1 (which is invalid for relative paths, but ignored for
@@ -77,9 +77,15 @@ func Filters() seccomp.SyscallRules {
 				nonNegativeFD,
 				seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS21Parameters)),
 			},
+			// Note that we don't need to add one for NVOS21ParametersV535, because
+			// SizeofNVOS21ParametersV535 == SizeofNVOS21Parameters. We test this.
 			seccomp.PerArg{
 				nonNegativeFD,
 				seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS64Parameters)),
+			},
+			seccomp.PerArg{
+				nonNegativeFD,
+				seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS64ParametersV535)),
 			},
 			seccomp.PerArg{
 				nonNegativeFD,
@@ -108,6 +114,10 @@ func Filters() seccomp.SyscallRules {
 			seccomp.PerArg{
 				nonNegativeFD,
 				seccomp.EqualTo(nvgpu.UVM_INITIALIZE),
+			},
+			seccomp.PerArg{
+				nonNegativeFD,
+				seccomp.EqualTo(nvgpu.UVM_MM_INITIALIZE),
 			},
 			seccomp.PerArg{
 				nonNegativeFD,
@@ -182,5 +192,5 @@ func Filters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.EqualTo(0),
 		},
-	}
+	})
 }
