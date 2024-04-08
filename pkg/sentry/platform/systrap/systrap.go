@@ -32,8 +32,8 @@
 //   - install seccomp filters to trap user system calls.
 //   - send a fake SIGSEGV to stop the thread in the signal handler.
 //
-// A context is just a collection of temporary variables. Calling Switch on a
-// context does the following:
+// A platformContext is just a collection of temporary variables. Calling Switch on a
+// platformContext does the following:
 //
 //	Set up proper registers and an FPU state on a stub signal frame.
 //	Wake up a stub thread by changing sysmsg->stage and calling FUTEX_WAKE.
@@ -43,7 +43,7 @@
 //
 //	subprocessPool.mu
 //		subprocess.mu
-//			context.mu
+//			platformContext.mu
 //
 // +checkalignedignore
 package systrap
@@ -53,6 +53,7 @@ import (
 	"os"
 	"sync"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -102,19 +103,23 @@ var (
 	// stubInitialized controls one-time stub initialization.
 	stubInitialized sync.Once
 
+	// latencyMonitoring controls one-time initialization of the fastpath
+	// control goroutine.
+	latencyMonitoring sync.Once
+
 	// archState stores architecture-specific details used in the platform.
 	archState sysmsg.ArchState
 )
 
-// context is an implementation of the platform context.
-type context struct {
+// platformContext is an implementation of the platform context.
+type platformContext struct {
 	// signalInfo is the signal info, if and when a signal is received.
 	signalInfo linux.SignalInfo
 
-	// interrupt is the interrupt context.
+	// interrupt is the interrupt platformContext.
 	interrupt interrupt.Forwarder
 
-	// sharedContext is everything related to this context that is resident in
+	// sharedContext is everything related to this platformContext that is resident in
 	// shared memory with the stub thread.
 	// sharedContext is only accessed on the Task goroutine, therefore it is not
 	// mutex protected.
@@ -123,8 +128,8 @@ type context struct {
 	// mu protects the following fields.
 	mu sync.Mutex
 
-	// If lastFaultSP is non-nil, the last context switch was due to a fault
-	// received while executing lastFaultSP. Only context.Switch may set
+	// If lastFaultSP is non-nil, the last platformContext switch was due to a fault
+	// received while executing lastFaultSP. Only platformContext.Switch may set
 	// lastFaultSP to a non-nil value.
 	lastFaultSP *subprocess
 
@@ -146,7 +151,7 @@ type context struct {
 }
 
 // PullFullState implements platform.Context.PullFullState.
-func (c *context) PullFullState(as platform.AddressSpace, ac *arch.Context64) error {
+func (c *platformContext) PullFullState(as platform.AddressSpace, ac *arch.Context64) error {
 	if !c.needToPullFullState {
 		return nil
 	}
@@ -159,13 +164,13 @@ func (c *context) PullFullState(as platform.AddressSpace, ac *arch.Context64) er
 }
 
 // FullStateChanged implements platform.Context.FullStateChanged.
-func (c *context) FullStateChanged() {
+func (c *platformContext) FullStateChanged() {
 	c.needRestoreFPState = true
 	c.needToPullFullState = false
 }
 
-// Switch runs the provided context in the given address space.
-func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
+// Switch runs the provided platformContext in the given address space.
+func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as := mm.AddressSpace()
 	s := as.(*subprocess)
 	if err := s.activateContext(c); err != nil {
@@ -204,7 +209,7 @@ restart:
 		faultIP = hostarch.Addr(ac.IP())
 	}
 
-	// Update the context to reflect the outcome of this context switch.
+	// Update the platformContext to reflect the outcome of this context switch.
 	c.mu.Lock()
 	lastFaultSP := c.lastFaultSP
 	lastFaultAddr := c.lastFaultAddr
@@ -267,13 +272,13 @@ restart:
 	return &si, at, platform.ErrContextSignal
 }
 
-// Interrupt interrupts the running guest application associated with this context.
-func (c *context) Interrupt() {
+// Interrupt interrupts the running guest application associated with this platformContext.
+func (c *platformContext) Interrupt() {
 	c.interrupt.NotifyInterrupt()
 }
 
-// Release releases all platform resources used by the context.
-func (c *context) Release() {
+// Release releases all platform resources used by the platformContext.
+func (c *platformContext) Release() {
 	if c.sharedContext != nil {
 		c.sharedContext.release()
 		c.sharedContext = nil
@@ -281,7 +286,7 @@ func (c *context) Release() {
 }
 
 // PrepareSleep implements platform.Context.platform.PrepareSleep.
-func (c *context) PrepareSleep() {
+func (c *platformContext) PrepareSleep() {
 	ctx := c.sharedContext
 	if ctx == nil {
 		return
@@ -337,6 +342,10 @@ func New() (*Systrap, error) {
 		initSysmsgThreadPriority()
 	})
 
+	latencyMonitoring.Do(func() {
+		go controlFastPath()
+	})
+
 	return &Systrap{memoryFile: mf}, nil
 }
 
@@ -369,9 +378,9 @@ func (p *Systrap) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, 
 	return as, nil, err
 }
 
-// NewContext returns an interruptible context.
+// NewContext returns an interruptible platformContext.
 func (*Systrap) NewContext(ctx pkgcontext.Context) platform.Context {
-	return &context{
+	return &platformContext{
 		needRestoreFPState:  true,
 		needToPullFullState: false,
 	}
@@ -414,4 +423,11 @@ func createMemoryFile() (*pgalloc.MemoryFile, error) {
 		return nil, fmt.Errorf("error creating pgalloc.MemoryFile: %v", err)
 	}
 	return mf, nil
+}
+
+func corruptedSharedMemoryErr(additional string) *platform.ContextError {
+	return &platform.ContextError{
+		Err:   fmt.Errorf("systrap corrupted memory: %s", additional),
+		Errno: unix.EPERM,
+	}
 }

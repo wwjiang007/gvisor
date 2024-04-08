@@ -26,20 +26,16 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Register registers all devices implemented by this package in vfsObj.
-func Register(vfsObj *vfs.VirtualFilesystem, uvmDevMajor uint32) error {
+func Register(vfsObj *vfs.VirtualFilesystem, versionStr string, uvmDevMajor uint32) error {
 	// The kernel driver's interface is unstable, so only allow versions of the
 	// driver that are known to be supported.
-	versionStr, err := hostDriverVersion()
-	if err != nil {
-		return fmt.Errorf("failed to get Nvidia driver version: %w", err)
-	}
-	version, err := driverVersionFrom(versionStr)
+	log.Infof("NVIDIA driver version: %s", versionStr)
+	version, err := DriverVersionFrom(versionStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse Nvidia driver version %s: %w", versionStr, err)
 	}
@@ -47,10 +43,10 @@ func Register(vfsObj *vfs.VirtualFilesystem, uvmDevMajor uint32) error {
 	if !ok {
 		return fmt.Errorf("unsupported Nvidia driver version: %s", versionStr)
 	}
-	log.Infof("Nvidia driver version: %s", versionStr)
 	nvp := &nvproxy{
 		objsLive: make(map[nvgpu.Handle]*object),
-		abi:      abiCons(),
+		abi:      abiCons.cons(),
+		version:  version,
 	}
 	for minor := uint32(0); minor <= nvgpu.NV_CONTROL_DEVICE_MINOR; minor++ {
 		if err := vfsObj.RegisterDevice(vfs.CharDevice, nvgpu.NV_MAJOR_DEVICE_NUMBER, minor, &frontendDevice{
@@ -72,30 +68,12 @@ func Register(vfsObj *vfs.VirtualFilesystem, uvmDevMajor uint32) error {
 	return nil
 }
 
-// CreateDriverDevtmpfsFiles creates device special files in dev that should
-// always exist when this package is enabled. It does not create per-device
-// files in dev; see CreateIndexDevtmpfsFile.
-func CreateDriverDevtmpfsFiles(ctx context.Context, dev *devtmpfs.Accessor, uvmDevMajor uint32) error {
-	if err := dev.CreateDeviceFile(ctx, "nvidiactl", vfs.CharDevice, nvgpu.NV_MAJOR_DEVICE_NUMBER, nvgpu.NV_CONTROL_DEVICE_MINOR, 0666); err != nil {
-		return err
-	}
-	if err := dev.CreateDeviceFile(ctx, "nvidia-uvm", vfs.CharDevice, uvmDevMajor, nvgpu.NVIDIA_UVM_PRIMARY_MINOR_NUMBER, 0666); err != nil {
-		return err
-	}
-	return nil
-}
-
-// CreateIndexDevtmpfsFile creates the device special file in dev for the
-// device with the given index.
-func CreateIndexDevtmpfsFile(ctx context.Context, dev *devtmpfs.Accessor, minor uint32) error {
-	return dev.CreateDeviceFile(ctx, fmt.Sprintf("nvidia%d", minor), vfs.CharDevice, nvgpu.NV_MAJOR_DEVICE_NUMBER, minor, 0666)
-}
-
 // +stateify savable
 type nvproxy struct {
-	objsMu   objsMutex `state:"nosave"`
-	objsLive map[nvgpu.Handle]*object
-	abi      *driverABI
+	objsMu   objsMutex                `state:"nosave"`
+	objsLive map[nvgpu.Handle]*object `state:"nosave"`
+	abi      *driverABI               `state:"nosave"`
+	version  DriverVersion
 }
 
 // object tracks an object allocated through the driver.

@@ -51,12 +51,15 @@ func BuildProgram(s *specs.LinuxSeccomp) (bpf.Program, error) {
 		return bpf.Program{}, fmt.Errorf("invalid seccomp rules: %w", err)
 	}
 
-	instrs, _, err := seccomp.BuildProgram(ruleset, defaultAction, killThreadAction)
+	instrs, _, err := seccomp.BuildProgram(ruleset, seccomp.ProgramOptions{
+		DefaultAction: defaultAction,
+		BadArchAction: killThreadAction,
+	})
 	if err != nil {
 		return bpf.Program{}, fmt.Errorf("building seccomp program: %w", err)
 	}
 
-	program, err := bpf.Compile(instrs)
+	program, err := bpf.Compile(instrs, true /* optimize */)
 	if err != nil {
 		return bpf.Program{}, fmt.Errorf("compiling seccomp program: %w", err)
 	}

@@ -152,6 +152,9 @@ func (s *TestStack) RouteTable() []Route {
 // Pause implements Stack.
 func (s *TestStack) Pause() {}
 
+// Restore implements Stack.
+func (s *TestStack) Restore() {}
+
 // Resume implements Stack.
 func (s *TestStack) Resume() {}
 

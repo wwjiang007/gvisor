@@ -84,7 +84,7 @@ type TaskConfig struct {
 	// MountNamespace is the MountNamespace of the new task.
 	MountNamespace *vfs.MountNamespace
 
-	// RSeqAddr is a pointer to the the userspace linux.RSeq structure.
+	// RSeqAddr is a pointer to the userspace linux.RSeq structure.
 	RSeqAddr hostarch.Addr
 
 	// RSeqSignature is the signature that the rseq abort IP must be signed
@@ -98,7 +98,7 @@ type TaskConfig struct {
 	InitialCgroups map[Cgroup]struct{}
 
 	// UserCounters is user resource counters.
-	UserCounters *userCounters
+	UserCounters *UserCounters
 
 	// SessionKeyring is the session keyring associated with the parent task.
 	// It may be nil.
@@ -176,7 +176,6 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	t.netns = cfg.NetworkNamespace
 	t.creds.Store(cfg.Credentials)
 	t.endStopCond.L = &t.tg.signalHandlers.mu
-	t.ptraceTracer.Store((*Task)(nil))
 	// We don't construct t.blockingTimer until Task.run(); see that function
 	// for justification.
 
@@ -185,7 +184,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		charged, committed bool
 	)
 
-	// Reserve cgroup PIDs controller charge. This is either commited when the
+	// Reserve cgroup PIDs controller charge. This is either committed when the
 	// new task enters the cgroup below, or rolled back on failure.
 	//
 	// We may also get here from a non-task context (for example, when

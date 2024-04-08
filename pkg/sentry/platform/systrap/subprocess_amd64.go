@@ -127,14 +127,13 @@ func dumpRegs(regs *arch.Registers) string {
 }
 
 // adjustInitregsRip adjust the current register RIP value to
-// be just before the system call instruction excution
+// be just before the system call instruction execution
 func (t *thread) adjustInitRegsRip() {
 	t.initRegs.Rip -= initRegsRipAdjustment
 }
 
 // Pass the expected PPID to the child via R15 when creating stub process.
 func initChildProcessPPID(initregs *arch.Registers, ppid int32) {
-	initregs.R15 = uint64(ppid)
 	// Rbx has to be set to 1 when creating stub process.
 	initregs.Rbx = _NEW_STUB
 }

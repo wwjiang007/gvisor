@@ -40,6 +40,8 @@ const (
 	UVM_REGISTER_GPU                   = 37
 	UVM_UNREGISTER_GPU                 = 38
 	UVM_PAGEABLE_MEM_ACCESS            = 39
+	UVM_SET_PREFERRED_LOCATION         = 42
+	UVM_DISABLE_READ_DUPLICATION       = 45
 	UVM_MAP_DYNAMIC_PARALLELISM_REGION = 65
 	UVM_ALLOC_SEMAPHORE_POOL           = 68
 	UVM_VALIDATE_VA_RANGE              = 72
@@ -75,7 +77,7 @@ type UVM_DESTROY_RANGE_GROUP_PARAMS struct {
 
 // +marshal
 type UVM_REGISTER_GPU_VASPACE_PARAMS struct {
-	GPUUUID  [16]uint8
+	GPUUUID  NvUUID
 	RMCtrlFD int32
 	HClient  Handle
 	HVASpace Handle
@@ -92,13 +94,13 @@ func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) SetRMCtrlFD(fd int32) {
 
 // +marshal
 type UVM_UNREGISTER_GPU_VASPACE_PARAMS struct {
-	GPUUUID  [16]uint8
+	GPUUUID  NvUUID
 	RMStatus uint32
 }
 
 // +marshal
 type UVM_REGISTER_CHANNEL_PARAMS struct {
-	GPUUUID  [16]uint8
+	GPUUUID  NvUUID
 	RMCtrlFD int32
 	HClient  Handle
 	HChannel Handle
@@ -119,7 +121,7 @@ func (p *UVM_REGISTER_CHANNEL_PARAMS) SetRMCtrlFD(fd int32) {
 
 // +marshal
 type UVM_UNREGISTER_CHANNEL_PARAMS struct {
-	GPUUUID  [16]uint8
+	GPUUUID  NvUUID
 	HClient  Handle
 	HChannel Handle
 	RMStatus uint32
@@ -147,6 +149,27 @@ func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) SetRMCtrlFD(fd int32) {
 }
 
 // +marshal
+type UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550 struct {
+	Base               uint64
+	Length             uint64
+	Offset             uint64
+	PerGPUAttributes   [UVM_MAX_GPUS_V2]UvmGpuMappingAttributes
+	GPUAttributesCount uint64
+	RMCtrlFD           int32
+	HClient            Handle
+	HMemory            Handle
+	RMStatus           uint32
+}
+
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) GetRMCtrlFD() int32 {
+	return p.RMCtrlFD
+}
+
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) SetRMCtrlFD(fd int32) {
+	p.RMCtrlFD = fd
+}
+
+// +marshal
 type UVM_FREE_PARAMS struct {
 	Base     uint64
 	Length   uint64
@@ -156,7 +179,7 @@ type UVM_FREE_PARAMS struct {
 
 // +marshal
 type UVM_REGISTER_GPU_PARAMS struct {
-	GPUUUID     [16]uint8
+	GPUUUID     NvUUID
 	NumaEnabled uint8
 	Pad         [3]byte
 	NumaNodeID  int32
@@ -176,7 +199,7 @@ func (p *UVM_REGISTER_GPU_PARAMS) SetRMCtrlFD(fd int32) {
 
 // +marshal
 type UVM_UNREGISTER_GPU_PARAMS struct {
-	GPUUUID  [16]uint8
+	GPUUUID  NvUUID
 	RMStatus uint32
 }
 
@@ -188,10 +211,36 @@ type UVM_PAGEABLE_MEM_ACCESS_PARAMS struct {
 }
 
 // +marshal
+type UVM_SET_PREFERRED_LOCATION_PARAMS struct {
+	RequestedBase     uint64
+	Length            uint64
+	PreferredLocation NvUUID
+	RMStatus          uint32
+	Pad0              [4]byte
+}
+
+// +marshal
+type UVM_SET_PREFERRED_LOCATION_PARAMS_V550 struct {
+	RequestedBase        uint64
+	Length               uint64
+	PreferredLocation    NvUUID
+	PreferredCPUNumaNode int32
+	RMStatus             uint32
+}
+
+// +marshal
+type UVM_DISABLE_READ_DUPLICATION_PARAMS struct {
+	RequestedBase uint64
+	Length        uint64
+	RMStatus      uint32
+	Pad0          [4]byte
+}
+
+// +marshal
 type UVM_MAP_DYNAMIC_PARALLELISM_REGION_PARAMS struct {
 	Base     uint64
 	Length   uint64
-	GPUUUID  [16]uint8
+	GPUUUID  NvUUID
 	RMStatus uint32
 	Pad0     [4]byte
 }
@@ -201,6 +250,16 @@ type UVM_ALLOC_SEMAPHORE_POOL_PARAMS struct {
 	Base               uint64
 	Length             uint64
 	PerGPUAttributes   [UVM_MAX_GPUS]UvmGpuMappingAttributes
+	GPUAttributesCount uint64
+	RMStatus           uint32
+	Pad0               [4]byte
+}
+
+// +marshal
+type UVM_ALLOC_SEMAPHORE_POOL_PARAMS_V550 struct {
+	Base               uint64
+	Length             uint64
+	PerGPUAttributes   [UVM_MAX_GPUS_V2]UvmGpuMappingAttributes
 	GPUAttributesCount uint64
 	RMStatus           uint32
 	Pad0               [4]byte
@@ -230,11 +289,14 @@ type UVM_MM_INITIALIZE_PARAMS struct {
 
 // From kernel-open/nvidia-uvm/uvm_types.h:
 
-const UVM_MAX_GPUS = NV_MAX_DEVICES
+const (
+	UVM_MAX_GPUS    = NV_MAX_DEVICES
+	UVM_MAX_GPUS_V2 = NV_MAX_DEVICES * NV_MAX_SUBDEVICES
+)
 
 // +marshal
 type UvmGpuMappingAttributes struct {
-	GPUUUID            [16]byte
+	GPUUUID            NvUUID
 	GPUMappingType     uint32
 	GPUCachingType     uint32
 	GPUFormatType      uint32

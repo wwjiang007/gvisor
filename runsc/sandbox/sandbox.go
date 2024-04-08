@@ -44,6 +44,7 @@ import (
 	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
@@ -223,10 +224,13 @@ type Args struct {
 	// UserLog is the filename to send user-visible logs to. It may be empty.
 	UserLog string
 
-	// IOFiles is the list of files that connect to a gofer endpoint for the
-	// mounts points using Gofers. They must be in the same order as mounts
-	// appear in the spec.
+	// IOFiles is the list of image files and/or socket files that connect to
+	// a gofer endpoint for the mount points using Gofers. They must be in the
+	// same order as mounts appear in the spec.
 	IOFiles []*os.File
+
+	// File that connects to a gofer endpoint for a device mount point at /dev.
+	DevIOFile *os.File
 
 	// GoferFilestoreFiles are the regular files that will back the overlayfs or
 	// tmpfs mount if a gofer mount is to be overlaid.
@@ -263,10 +267,6 @@ type Args struct {
 
 	// ExecFile is the file from the host used for program execution.
 	ExecFile *os.File
-
-	// NvidiaDevMinors is the list of device minors for Nvidia GPU devices
-	// exposed to the sandbox.
-	NvidiaDevMinors boot.NvidiaDevMinors
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -403,7 +403,7 @@ func (s *Sandbox) StartRoot(conf *config.Config) error {
 }
 
 // StartSubcontainer starts running a sub-container inside the sandbox.
-func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, goferConfs []boot.GoferMountConf) error {
+func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []boot.GoferMountConf) error {
 	log.Debugf("Start sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.load())
 
 	if err := s.configureStdios(conf, stdios); err != nil {
@@ -414,10 +414,14 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 	// The payload contains (in this specific order):
 	// * stdin/stdout/stderr (optional: only present when not using TTY)
 	// * The subcontainer's gofer filestore files (optional)
+	// * The subcontainer's dev gofer file (optional)
 	// * Gofer files.
 	payload := urpc.FilePayload{}
 	payload.Files = append(payload.Files, stdios...)
 	payload.Files = append(payload.Files, goferFilestores...)
+	if devIOFile != nil {
+		payload.Files = append(payload.Files, devIOFile)
+	}
 	payload.Files = append(payload.Files, goferFiles...)
 
 	// Start running the container.
@@ -426,6 +430,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 		Conf:                 conf,
 		CID:                  cid,
 		NumGoferFilestoreFDs: len(goferFilestores),
+		IsDevIoFilePresent:   devIOFile != nil,
 		GoferMountConfs:      goferConfs,
 		FilePayload:          payload,
 	}
@@ -642,6 +647,11 @@ func (s *Sandbox) connError(err error) error {
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
 // command, passing in the bundle dir.
 func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyncFile *os.File) error {
+	// Ensure we don't leak FDs to the sandbox process.
+	if err := SetCloExeOnAllFDs(); err != nil {
+		return fmt.Errorf("setting CLOEXEC on all FDs: %w", err)
+	}
+
 	donations := donation.Agency{}
 	defer donations.Close()
 
@@ -733,6 +743,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	donations.DonateAndClose("io-fds", args.IOFiles...)
+	donations.DonateAndClose("dev-io-fd", args.DevIOFile)
 	donations.DonateAndClose("gofer-filestore-fds", args.GoferFilestoreFiles...)
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
 	donations.Donate("start-sync-fd", startSyncFile)
@@ -754,11 +765,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 	if err := donations.OpenAndDonate("trace-fd", conf.TraceFile, profFlags); err != nil {
 		return err
-	}
-
-	// Pass nvidia device minors.
-	if len(args.NvidiaDevMinors) > 0 {
-		cmd.Args = append(cmd.Args, "--nvidia-dev-minors="+args.NvidiaDevMinors.String())
 	}
 
 	// Pass gofer mount configs.
@@ -820,6 +826,14 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		log.Infof("Sandbox will be started in a new PID namespace")
 		nss = append(nss, specs.LinuxNamespace{Type: specs.PIDNamespace})
 		cmd.Args = append(cmd.Args, "--pidns=true")
+	}
+
+	if specutils.NVProxyEnabled(args.Spec, conf) {
+		nvidiaDriverVersion, err := nvproxy.HostDriverVersion()
+		if err != nil {
+			return fmt.Errorf("failed to get Nvidia driver version: %w", err)
+		}
+		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+nvidiaDriverVersion)
 	}
 
 	// Joins the network namespace if network is enabled. the sandbox talks
@@ -1453,7 +1467,7 @@ func (s *Sandbox) waitForStopped() error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 	op := func() error {
@@ -1693,4 +1707,52 @@ func (s *Sandbox) Mount(cid, fstype, src, dest string) error {
 		FilePayload: urpc.FilePayload{Files: files},
 	}
 	return s.call(boot.ContMgrMount, &args, nil)
+}
+
+func setCloExeOnAllFDs() error {
+	f, err := os.Open("/proc/self/fd")
+	if err != nil {
+		return fmt.Errorf("failed to open /proc/self/fd: %w", err)
+
+	}
+	defer f.Close()
+	for {
+		dents, err := f.Readdirnames(256)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("failed to read /proc/self/fd: %w", err)
+		}
+		for _, dent := range dents {
+			fd, err := strconv.Atoi(dent)
+			if err != nil {
+				return fmt.Errorf("failed to convert /proc/self/fd entry %q to int: %w", dent, err)
+			}
+			if fd == int(f.Fd()) {
+				continue
+			}
+			flags, _, errno := unix.RawSyscall(unix.SYS_FCNTL, uintptr(fd), unix.F_GETFD, 0)
+			if errno != 0 {
+				return fmt.Errorf("error getting descriptor flags: %w", errno)
+			}
+			if flags&unix.FD_CLOEXEC != 0 {
+				continue
+			}
+			flags |= unix.FD_CLOEXEC
+			if _, _, errno := unix.RawSyscall(unix.SYS_FCNTL, uintptr(fd), unix.F_SETFD, flags); errno != 0 {
+				return fmt.Errorf("error setting CLOEXEC: %w", errno)
+			}
+		}
+	}
+	return nil
+}
+
+var setCloseExecOnce sync.Once
+
+// SetCloExeOnAllFDs sets CLOEXEC on all FDs in /proc/self/fd. This avoids
+// leaking inherited FDs from the parent (caller) to subprocesses created.
+func SetCloExeOnAllFDs() (retErr error) {
+	// Sufficient to do this only once per runsc invocation. Avoid double work.
+	setCloseExecOnce.Do(func() { retErr = setCloExeOnAllFDs() })
+	return
 }

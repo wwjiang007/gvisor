@@ -75,6 +75,24 @@ func ctrlClientSystemGetBuildVersionInvoke(fi *frontendIoctlState, ioctlParams *
 	return n, nil
 }
 
+func ctrlDevGpuGetClasslistInvoke(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters, ctrlParams *nvgpu.NV0080_CTRL_GPU_GET_CLASSLIST_PARAMS, classList []uint32) (uintptr, error) {
+	sentryCtrlParams := *ctrlParams
+	sentryCtrlParams.ClassList = p64FromPtr(unsafe.Pointer(&classList[0]))
+	n, err := rmControlInvoke(fi, ioctlParams, &sentryCtrlParams)
+	if err != nil {
+		return n, err
+	}
+	if _, err := primitive.CopyUint32SliceOut(fi.t, addrFromP64(ctrlParams.ClassList), classList); err != nil {
+		return 0, err
+	}
+	outCtrlParams := sentryCtrlParams
+	outCtrlParams.ClassList = ctrlParams.ClassList
+	if _, err := outCtrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func ctrlDevFIFOGetChannelList(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
 	var ctrlParams nvgpu.NV0080_CTRL_FIFO_GET_CHANNELLIST_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
@@ -158,11 +176,11 @@ func ctrlSubdevGRGetInfo(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parame
 	return n, nil
 }
 
-func rmAllocInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64ParametersV535, allocParams *Params, isNVOS64 bool) (uintptr, error) {
+func rmAllocInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64Parameters, allocParams *Params, isNVOS64 bool) (uintptr, error) {
 	defer runtime.KeepAlive(allocParams) // since we convert to non-pointer-typed P64
 
-	sentryIoctlParams := nvgpu.GetRmAllocParamObj(isNVOS64, fi.fd.nvp.abi.useRmAllocParamsV535)
-	sentryIoctlParams.FromOS64V535(*ioctlParams)
+	sentryIoctlParams := nvgpu.GetRmAllocParamObj(isNVOS64)
+	sentryIoctlParams.FromOS64(*ioctlParams)
 	sentryIoctlParams.SetPAllocParms(p64FromPtr(unsafe.Pointer(allocParams)))
 	var rightsRequested nvgpu.RS_ACCESS_MASK
 	if ioctlParams.PRightsRequested != 0 {

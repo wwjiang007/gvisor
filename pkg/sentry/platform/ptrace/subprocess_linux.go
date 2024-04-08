@@ -83,7 +83,7 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 				unix.SYS_CLONE: seccomp.Or{
 					// Allow creation of new subprocesses (used by the master).
 					seccomp.PerArg{seccomp.EqualTo(unix.CLONE_FILES | unix.SIGKILL)},
-					// Allow creation of new threads within a single address space (used by addresss spaces).
+					// Allow creation of new threads within a single address space (used by address spaces).
 					seccomp.PerArg{
 						seccomp.EqualTo(
 							unix.CLONE_FILES |
@@ -114,7 +114,10 @@ func attachedThread(flags uintptr, defaultAction linux.BPFAction) (*thread, erro
 		})
 	}
 	rules = appendArchSeccompRules(rules, defaultAction)
-	instrs, _, err := seccomp.BuildProgram(rules, defaultAction, defaultAction)
+	instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
+		DefaultAction: defaultAction,
+		BadArchAction: defaultAction,
+	})
 	if err != nil {
 		return nil, err
 	}

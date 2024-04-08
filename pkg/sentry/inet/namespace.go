@@ -15,6 +15,8 @@
 package inet
 
 import (
+	goContext "context"
+
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/nsfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -129,6 +131,12 @@ func (n *Namespace) RestoreRootStack(stack Stack) {
 	n.stack = stack
 }
 
+// ResetStack resets the stack in the network namespace to nil. This should
+// only be called when restoring kernel.
+func (n *Namespace) ResetStack() {
+	n.stack = nil
+}
+
 func (n *Namespace) init() {
 	// Root network namespace will have stack assigned later.
 	if n.isRoot {
@@ -145,7 +153,7 @@ func (n *Namespace) init() {
 }
 
 // afterLoad is invoked by stateify.
-func (n *Namespace) afterLoad() {
+func (n *Namespace) afterLoad(goContext.Context) {
 	n.init()
 }
 

@@ -157,14 +157,22 @@ func (t *syscallThread) mapMessageIntoStub() error {
 }
 
 // attach attaches to the stub thread with ptrace and unlock signals.
-func (t *syscallThread) attach() {
-	t.thread.attach()
+func (t *syscallThread) attach() error {
+	if err := t.thread.attach(); err != nil {
+		return err
+	}
 	// We need to unblock signals, because the TRAP signal is used to run
 	// syscalls via ptrace.
 	t.unmaskAllSignalsAttached()
+	return nil
 }
 
+const maxErrno = 4095
+
 func (t *syscallThread) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintptr, error) {
+	if t.subproc.dead.Load() {
+		return 0, errDeadSubprocess
+	}
 	sentryMsg := t.sentryMessage
 	stubMsg := t.stubMessage
 	sentryMsg.sysno = uint64(sysno)
@@ -185,6 +193,11 @@ func (t *syscallThread) syscall(sysno uintptr, args ...arch.SyscallArgument) (ui
 	// futex waits for sentryMsg.state that isn't changed, so it will
 	// returns only only when the other side will call FUTEX_WAKE.
 	futexWaitWake(&sentryMsg.state, atomic.LoadUint32(&sentryMsg.state))
+
+	errno := -uintptr(stubMsg.ret)
+	if errno > 0 && errno < maxErrno {
+		return 0, fmt.Errorf("stub syscall (%x, %#v) failed with %w", sysno, args, unix.Errno(errno))
+	}
 
 	return uintptr(stubMsg.ret), nil
 }

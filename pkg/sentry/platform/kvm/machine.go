@@ -450,7 +450,7 @@ func (m *machine) Destroy() {
 //
 // It is guaranteed that if any OS thread TID is in guest, m.vCPUs[TID] points
 // to the vCPU in which the OS thread TID is running. So if Get() returns with
-// the corrent context in guest, the vCPU of it must be the same as what
+// the current context in guest, the vCPU of it must be the same as what
 // Get() returns.
 func (m *machine) Get() *vCPU {
 	m.mu.RLock()
@@ -791,7 +791,10 @@ func seccompMmapRules(m *machine) {
 				Action: linux.SECCOMP_RET_TRAP,
 			},
 		}
-		instrs, _, err := seccomp.BuildProgram(rules, linux.SECCOMP_RET_ALLOW, linux.SECCOMP_RET_ALLOW)
+		instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
+			DefaultAction: linux.SECCOMP_RET_ALLOW,
+			BadArchAction: linux.SECCOMP_RET_ALLOW,
+		})
 		if err != nil {
 			panic(fmt.Sprintf("failed to build rules: %v", err))
 		}

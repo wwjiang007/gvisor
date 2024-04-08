@@ -41,6 +41,12 @@ const (
 	NV_MAX_SUBDEVICES = 8
 )
 
+// From src/common/sdk/nvidia/inc/alloc/alloc_channel.h.
+const (
+	CC_CHAN_ALLOC_IV_SIZE_DWORD    = 3
+	CC_CHAN_ALLOC_NONCE_SIZE_DWORD = 8
+)
+
 // RS_ACCESS_MASK is RS_ACCESS_MASK, from
 // src/common/sdk/nvidia/inc/rs_access.h.
 //
@@ -62,3 +68,8 @@ type RS_SHARE_POLICY struct {
 	Action     uint8
 	Pad        [1]byte
 }
+
+// NvUUID is defined in src/common/inc/nvCpuUuid.h.
+//
+// +marshal
+type NvUUID [16]uint8

@@ -3,6 +3,8 @@
 package nvproxy
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
@@ -26,10 +28,10 @@ func (dev *frontendDevice) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &dev.minor)
 }
 
-func (dev *frontendDevice) afterLoad() {}
+func (dev *frontendDevice) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (dev *frontendDevice) StateLoad(stateSourceObject state.Source) {
+func (dev *frontendDevice) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &dev.nvp)
 	stateSourceObject.Load(1, &dev.minor)
 }
@@ -40,26 +42,20 @@ func (n *nvproxy) StateTypeName() string {
 
 func (n *nvproxy) StateFields() []string {
 	return []string{
-		"objsLive",
-		"abi",
+		"version",
 	}
 }
-
-func (n *nvproxy) beforeSave() {}
 
 // +checklocksignore
 func (n *nvproxy) StateSave(stateSinkObject state.Sink) {
 	n.beforeSave()
-	stateSinkObject.Save(0, &n.objsLive)
-	stateSinkObject.Save(1, &n.abi)
+	stateSinkObject.Save(0, &n.version)
 }
 
-func (n *nvproxy) afterLoad() {}
-
 // +checklocksignore
-func (n *nvproxy) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &n.objsLive)
-	stateSourceObject.Load(1, &n.abi)
+func (n *nvproxy) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &n.version)
+	stateSourceObject.AfterLoad(func() { n.afterLoad(ctx) })
 }
 
 func (o *object) StateTypeName() string {
@@ -80,10 +76,10 @@ func (o *object) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &o.impl)
 }
 
-func (o *object) afterLoad() {}
+func (o *object) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (o *object) StateLoad(stateSourceObject state.Source) {
+func (o *object) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &o.impl)
 }
 
@@ -107,10 +103,10 @@ func (o *osDescMem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &o.pinnedRanges)
 }
 
-func (o *osDescMem) afterLoad() {}
+func (o *osDescMem) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (o *osDescMem) StateLoad(stateSourceObject state.Source) {
+func (o *osDescMem) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &o.object)
 	stateSourceObject.Load(1, &o.pinnedRanges)
 }
@@ -133,11 +129,42 @@ func (dev *uvmDevice) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &dev.nvp)
 }
 
-func (dev *uvmDevice) afterLoad() {}
+func (dev *uvmDevice) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (dev *uvmDevice) StateLoad(stateSourceObject state.Source) {
+func (dev *uvmDevice) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &dev.nvp)
+}
+
+func (v *DriverVersion) StateTypeName() string {
+	return "pkg/sentry/devices/nvproxy.DriverVersion"
+}
+
+func (v *DriverVersion) StateFields() []string {
+	return []string{
+		"major",
+		"minor",
+		"patch",
+	}
+}
+
+func (v *DriverVersion) beforeSave() {}
+
+// +checklocksignore
+func (v *DriverVersion) StateSave(stateSinkObject state.Sink) {
+	v.beforeSave()
+	stateSinkObject.Save(0, &v.major)
+	stateSinkObject.Save(1, &v.minor)
+	stateSinkObject.Save(2, &v.patch)
+}
+
+func (v *DriverVersion) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (v *DriverVersion) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &v.major)
+	stateSourceObject.Load(1, &v.minor)
+	stateSourceObject.Load(2, &v.patch)
 }
 
 func init() {
@@ -146,4 +173,5 @@ func init() {
 	state.Register((*object)(nil))
 	state.Register((*osDescMem)(nil))
 	state.Register((*uvmDevice)(nil))
+	state.Register((*DriverVersion)(nil))
 }

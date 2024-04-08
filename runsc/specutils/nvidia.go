@@ -16,9 +16,6 @@ package specutils
 
 import (
 	"fmt"
-	"path"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -30,7 +27,7 @@ import (
 const nvdEnvVar = "NVIDIA_VISIBLE_DEVICES"
 
 // annotationNVProxy enables nvproxy.
-const annotationNVProxy = "dev.gvisor.spec.nvproxy"
+const annotationNVProxy = "dev.gvisor.internal.nvproxy"
 
 // NVProxyEnabled checks both the nvproxy annotation and conf.NVProxy to see if nvproxy is enabled.
 func NVProxyEnabled(spec *specs.Spec, conf *config.Config) bool {
@@ -38,27 +35,55 @@ func NVProxyEnabled(spec *specs.Spec, conf *config.Config) bool {
 		return true
 	}
 	val, ok := spec.Annotations[annotationNVProxy]
-	if ok && val != "true" {
-		log.Warningf("nvproxy annotation is set to invalid value %q. Ignoring.", val)
+	if !ok {
+		return false
 	}
-	return ok && val == "true"
+	ret, err := strconv.ParseBool(val)
+	if err != nil {
+		log.Warningf("nvproxy annotation set to invalid value %q: %w. Skipping.", val, err)
+	}
+	return ret
 }
 
-// GPUFunctionalityRequested returns true if the user intends for the sandbox
-// to have access to GPU functionality (e.g. access to /dev/nvidiactl),
-// irrespective of whether or not they want access to any specific GPU.
+// GPUFunctionalityRequested returns true if the container should have access
+// to GPU functionality.
 func GPUFunctionalityRequested(spec *specs.Spec, conf *config.Config) bool {
 	if !NVProxyEnabled(spec, conf) {
 		// nvproxy disabled.
 		return false
 	}
-	if !conf.NVProxyDocker {
-		// nvproxy enabled in non-Docker mode.
-		return true
+	// In GKE, the nvidia_gpu device plugin injects NVIDIA devices into
+	// spec.Linux.Devices when GPUs are allocated to a container.
+	if spec.Linux != nil {
+		for _, dev := range spec.Linux.Devices {
+			if dev.Path == "/dev/nvidiactl" {
+				return true
+			}
+		}
 	}
-	// nvproxy enabled in Docker mode.
-	// GPU access is only requested if NVIDIA_VISIBLE_DEVICES is non-empty
-	// and set to a value that doesn't mean "no GPU".
+	return gpuFunctionalityRequestedViaHook(spec, conf)
+}
+
+// GPUFunctionalityRequestedViaHook returns true if the container should have
+// access to GPU functionality configured via nvidia-container-runtime-hook.
+// This hook is used by:
+// - Docker when using `--gpus` flag from the CLI.
+// - nvidia-container-runtime when using its legacy mode.
+func GPUFunctionalityRequestedViaHook(spec *specs.Spec, conf *config.Config) bool {
+	if !NVProxyEnabled(spec, conf) {
+		// nvproxy disabled.
+		return false
+	}
+	return gpuFunctionalityRequestedViaHook(spec, conf)
+}
+
+// Precondition: NVProxyEnabled(spec, conf).
+func gpuFunctionalityRequestedViaHook(spec *specs.Spec, conf *config.Config) bool {
+	if !isNvidiaHookPresent(spec, conf) {
+		return false
+	}
+	// In Docker mode, GPU access is only requested if NVIDIA_VISIBLE_DEVICES is
+	// non-empty and set to a value that doesn't mean "no GPU".
 	if spec.Process == nil {
 		return false
 	}
@@ -68,42 +93,27 @@ func GPUFunctionalityRequested(spec *specs.Spec, conf *config.Config) bool {
 	return nvd != "" && nvd != "void"
 }
 
-// FindAllGPUDevices returns the Nvidia GPU device minor numbers of all GPUs
-// mounted in the provided rootfs.
-func FindAllGPUDevices(rootfs string) ([]uint32, error) {
-	devPathPrefix := path.Join(rootfs, "dev/nvidia")
-	nvidiaDeviceRegex := regexp.MustCompile(fmt.Sprintf(`^%s(\d+)$`, devPathPrefix))
-	paths, err := filepath.Glob(devPathPrefix + "*")
-	if err != nil {
-		return nil, fmt.Errorf("enumerating Nvidia device files: %w", err)
+func isNvidiaHookPresent(spec *specs.Spec, conf *config.Config) bool {
+	if conf.NVProxyDocker {
+		// This has the effect of injecting the nvidia-container-runtime-hook.
+		return true
 	}
-	var devMinors []uint32
-	for _, path := range paths {
-		if ms := nvidiaDeviceRegex.FindStringSubmatch(path); ms != nil {
-			index, err := strconv.ParseUint(ms[1], 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid host device file %q: %w", path, err)
+
+	if spec.Hooks != nil {
+		for _, h := range spec.Hooks.Prestart {
+			if strings.HasSuffix(h.Path, "/nvidia-container-runtime-hook") {
+				return true
 			}
-			devMinors = append(devMinors, uint32(index))
 		}
 	}
-	return devMinors, nil
+	return false
 }
 
-// NvidiaDeviceList returns the list of devices that should be visible to the
-// sandbox. In Docker mode, this is the set of devices specified in
-// NVIDIA_VISIBLE_DEVICES. In non-Docker mode, this is all Nvidia devices, as
-// we cannot know the set of usable GPUs until subcontainer creation.
-func NvidiaDeviceList(spec *specs.Spec, conf *config.Config) (string, error) {
-	if !GPUFunctionalityRequested(spec, conf) {
-		return "", nil
-	}
-	if !conf.NVProxyDocker {
-		// nvproxy enabled in non-Docker mode.
-		// Return all GPUs on the machine.
-		return "all", nil
-	}
-	// nvproxy is enabled in Docker mode.
+// ParseNvidiaVisibleDevices parses NVIDIA_VISIBLE_DEVICES env var and returns
+// the devices specified in it. This can be passed to nvidia-container-cli.
+//
+// Precondition: conf.NVProxyDocker && GPUFunctionalityRequested(spec, conf).
+func ParseNvidiaVisibleDevices(spec *specs.Spec) (string, error) {
 	nvd, _ := EnvVar(spec.Process.Env, nvdEnvVar)
 	if nvd == "none" {
 		return "", nil

@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -81,17 +82,17 @@ import (
 // allow easy access everywhere.
 var IOUringEnabled = false
 
-// userCounters is a set of user counters.
+// UserCounters is a set of user counters.
 //
 // +stateify savable
-type userCounters struct {
+type UserCounters struct {
 	uid auth.KUID
 
 	rlimitNProc atomicbitops.Uint64
 }
 
 // incRLimitNProc increments the rlimitNProc counter.
-func (uc *userCounters) incRLimitNProc(ctx context.Context) error {
+func (uc *UserCounters) incRLimitNProc(ctx context.Context) error {
 	lim := limits.FromContext(ctx).Get(limits.ProcessCount)
 	creds := auth.CredentialsFromContext(ctx)
 	nproc := uc.rlimitNProc.Add(1)
@@ -105,8 +106,18 @@ func (uc *userCounters) incRLimitNProc(ctx context.Context) error {
 }
 
 // decRLimitNProc decrements the rlimitNProc counter.
-func (uc *userCounters) decRLimitNProc() {
+func (uc *UserCounters) decRLimitNProc() {
 	uc.rlimitNProc.Add(^uint64(0))
+}
+
+// CgroupMount contains the cgroup mount. These mounts are created for the root
+// container by default and are stored in the kernel.
+//
+// +stateify savable
+type CgroupMount struct {
+	Fs    *vfs.Filesystem
+	Root  *vfs.Dentry
+	Mount *vfs.Mount
 }
 
 // Kernel represents an emulated Linux kernel. It must be initialized by calling
@@ -131,8 +142,7 @@ type Kernel struct {
 	// All of the following fields are immutable unless otherwise specified.
 
 	// Platform is the platform that is used to execute tasks in the created
-	// Kernel. See comment on pgalloc.MemoryFileProvider for why Platform is
-	// embedded anonymously (the same issue applies).
+	// Kernel.
 	platform.Platform `state:"nosave"`
 
 	// mf provides application memory.
@@ -320,9 +330,27 @@ type Kernel struct {
 	// the system.
 	cgroupRegistry *CgroupRegistry
 
+	// cgroupMountsMap maps the cgroup controller names to the cgroup mounts
+	// created for the root container. These mounts are then bind mounted
+	// for other application containers by creating their own container
+	// directories.
+	cgroupMountsMap   map[string]*CgroupMount
+	cgroupMountsMapMu cgroupMountsMutex `state:"nosave"`
+
 	// userCountersMap maps auth.KUID into a set of user counters.
-	userCountersMap   map[auth.KUID]*userCounters
+	userCountersMap   map[auth.KUID]*UserCounters
 	userCountersMapMu userCountersMutex `state:"nosave"`
+
+	// MaxFDLimit specifies the maximum file descriptor number that can be
+	// used by processes.
+	MaxFDLimit atomicbitops.Int32
+
+	// devGofers maps container ID to its device gofer client.
+	devGofers   map[string]*devutil.GoferClient `state:"nosave"`
+	devGofersMu sync.Mutex                      `state:"nosave"`
+
+	// cid -> name.
+	containerNames map[string]string
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -367,6 +395,11 @@ type InitKernelArgs struct {
 
 	// PIDNamespace is the root PID namespace.
 	PIDNamespace *PIDNamespace
+
+	// MaxFDLimit specifies the maximum file descriptor number that can be
+	// used by processes.  If it is zero, the limit will be set to
+	// unlimited.
+	MaxFDLimit int32
 }
 
 // Init initialize the Kernel with no tasks.
@@ -419,7 +452,12 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.netlinkPorts = port.New()
 	k.ptraceExceptions = make(map[*Task]*Task)
 	k.YAMAPtraceScope = atomicbitops.FromInt32(linux.YAMA_SCOPE_RELATIONAL)
-	k.userCountersMap = make(map[auth.KUID]*userCounters)
+	k.userCountersMap = make(map[auth.KUID]*UserCounters)
+	if args.MaxFDLimit == 0 {
+		args.MaxFDLimit = MaxFdLimit
+	}
+	k.MaxFDLimit.Store(args.MaxFDLimit)
+	k.containerNames = make(map[string]string)
 
 	ctx := k.SupervisorContext()
 	if err := k.vfs.Init(ctx); err != nil {
@@ -456,6 +494,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			// value for sbinfo->max_blocks when SB_KERNMOUNT is set.
 			DisableDefaultSizeLimit: true,
 		},
+		InternalMount: true,
 	}
 	tmpfsFilesystem, tmpfsRoot, err := tmpfs.FilesystemType{}.GetFilesystem(ctx, &k.vfs, auth.NewRootCredentials(k.rootUserNamespace), "", tmpfsOpts)
 	if err != nil {
@@ -484,6 +523,54 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	return nil
 }
 
+// +stateify savable
+type privateMemoryFileMetadata struct {
+	owners []string
+}
+
+func savePrivateMFs(ctx context.Context, w wire.Writer, mfsToSave map[string]*pgalloc.MemoryFile) error {
+	var meta privateMemoryFileMetadata
+	// Generate the order in which private memory files are saved.
+	for fsID := range mfsToSave {
+		meta.owners = append(meta.owners, fsID)
+	}
+	// Save the metadata.
+	if _, err := state.Save(ctx, w, &meta); err != nil {
+		return err
+	}
+	// Followed by the private memory files in order.
+	for _, fsID := range meta.owners {
+		if err := mfsToSave[fsID].SaveTo(ctx, w); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadPrivateMFs(ctx context.Context, r wire.Reader) error {
+	// Load the metadata.
+	var meta privateMemoryFileMetadata
+	if _, err := state.Load(ctx, r, &meta); err != nil {
+		return err
+	}
+	mfmap := pgalloc.MemoryFileMapFromContext(ctx)
+	// Ensure that it is consistent with CtxFilesystemMemoryFileMap.
+	if len(mfmap) != len(meta.owners) {
+		return fmt.Errorf("inconsistent private memory files on restore: savedMFOwners = %v, CtxFilesystemMemoryFileMap = %v", meta.owners, mfmap)
+	}
+	// Load all private memory files.
+	for _, fsID := range meta.owners {
+		mf, ok := mfmap[fsID]
+		if !ok {
+			return fmt.Errorf("saved memory file for %q was not configured on restore", fsID)
+		}
+		if err := mf.LoadFrom(ctx, r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SaveTo saves the state of k to w.
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
@@ -507,11 +594,19 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 		return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
 	}
 
+	// Capture all private memory files.
+	mfsToSave := make(map[string]*pgalloc.MemoryFile)
+	vfsCtx := context.WithValue(ctx, pgalloc.CtxMemoryFileMap, mfsToSave)
 	// Prepare filesystems for saving. This must be done after
 	// invalidateUnsavableMappings(), since dropping memory mappings may
 	// affect filesystem state (e.g. page cache reference counts).
-	if err := k.vfs.PrepareSave(ctx); err != nil {
+	if err := k.vfs.PrepareSave(vfsCtx); err != nil {
 		return err
+	}
+	// Mark all to-be-saved MemoryFiles as savable to inform kernel save below.
+	k.mf.MarkSavable()
+	for _, mf := range mfsToSave {
+		mf.MarkSavable()
 	}
 
 	// Save the CPUID FeatureSet before the rest of the kernel so we can
@@ -545,12 +640,15 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 	log.Infof("Kernel save stats: %s", stats.String())
 	log.Infof("Kernel save took [%s].", time.Since(kernelStart))
 
-	// Save the memory file's state.
+	// Save the memory files' state.
 	memoryStart := time.Now()
 	if err := k.mf.SaveTo(ctx, w); err != nil {
 		return err
 	}
-	log.Infof("Memory save took [%s].", time.Since(memoryStart))
+	if err := savePrivateMFs(ctx, w, mfsToSave); err != nil {
+		return err
+	}
+	log.Infof("Memory files save took [%s].", time.Since(memoryStart))
 
 	log.Infof("Overall save took [%s].", time.Since(saveStart))
 
@@ -623,12 +721,15 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 	// Restore the root network stack.
 	k.rootNetworkNamespace.RestoreRootStack(net)
 
-	// Load the memory file's state.
+	// Load the memory files' state.
 	memoryStart := time.Now()
 	if err := k.mf.LoadFrom(ctx, r); err != nil {
 		return err
 	}
-	log.Infof("Memory load took [%s].", time.Since(memoryStart))
+	if err := loadPrivateMFs(ctx, r); err != nil {
+		return err
+	}
+	log.Infof("Memory files load took [%s].", time.Since(memoryStart))
 
 	log.Infof("Overall load took [%s]", time.Since(loadStart))
 
@@ -639,7 +740,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 	}
 
 	if net != nil {
-		net.Resume()
+		net.Restore()
 	}
 
 	if err := k.vfs.CompleteRestore(ctx, vfsOpts); err != nil {
@@ -784,6 +885,8 @@ func (ctx *createProcessContext) Value(key any) any {
 		mntns := ctx.kernel.GlobalInit().Leader().MountNamespace()
 		mntns.IncRef()
 		return mntns
+	case devutil.CtxDevGoferClient:
+		return ctx.kernel.getDevGoferClient(ctx.args.ContainerID)
 	case inet.CtxStack:
 		return ctx.kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
@@ -794,8 +897,6 @@ func (ctx *createProcessContext) Value(key any) any {
 		return ctx.getMemoryCgroupID()
 	case pgalloc.CtxMemoryFile:
 		return ctx.kernel.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return ctx.kernel
 	case platform.CtxPlatform:
 		return ctx.kernel
 	case uniqueid.CtxGlobalUniqueID:
@@ -922,9 +1023,18 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	if se != nil {
 		return nil, 0, errors.New(se.String())
 	}
-
-	// Take a reference on the FDTable, which will be transferred to
-	// TaskSet.NewTask().
+	var capData auth.VfsCapData
+	if len(image.FileCaps()) != 0 {
+		var err error
+		capData, err = auth.VfsCapDataOf([]byte(image.FileCaps()))
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	creds, err := auth.CapsFromVfsCaps(capData, args.Credentials)
+	if err != nil {
+		return nil, 0, err
+	}
 	args.FDTable.IncRef()
 
 	// Create the task.
@@ -934,7 +1044,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		TaskImage:        image,
 		FSContext:        fsContext,
 		FDTable:          args.FDTable,
-		Credentials:      args.Credentials,
+		Credentials:      creds,
 		NetworkNamespace: k.RootNetworkNamespace(),
 		AllowedCPUMask:   sched.NewFullCPUSet(k.applicationCores),
 		UTSNamespace:     args.UTSNamespace,
@@ -946,6 +1056,8 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		// A task with no parent starts out with no session keyring.
 		SessionKeyring: nil,
 	}
+	config.UTSNamespace.IncRef()
+	config.IPCNamespace.IncRef()
 	config.NetworkNamespace.IncRef()
 	t, err := k.tasks.NewTask(ctx, config)
 	if err != nil {
@@ -1014,7 +1126,7 @@ func (k *Kernel) Start() error {
 func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 	// Since all task goroutines have been stopped by precondition, the CPU clock
 	// ticker should stop on its own; wait for it to do so, waking it up from
-	// sleeping betwen ticks if necessary.
+	// sleeping between ticks if necessary.
 	k.runningTasksMu.Lock()
 	for k.cpuClockTickerRunning {
 		select {
@@ -1300,13 +1412,11 @@ func (k *Kernel) RootUserNamespace() *auth.UserNamespace {
 
 // RootUTSNamespace returns the root UTSNamespace.
 func (k *Kernel) RootUTSNamespace() *UTSNamespace {
-	k.rootUTSNamespace.IncRef()
 	return k.rootUTSNamespace
 }
 
 // RootIPCNamespace takes a reference and returns the root IPCNamespace.
 func (k *Kernel) RootIPCNamespace() *IPCNamespace {
-	k.rootIPCNamespace.IncRef()
 	return k.rootIPCNamespace
 }
 
@@ -1433,7 +1543,7 @@ func (k *Kernel) SetMemoryFile(mf *pgalloc.MemoryFile) {
 	k.mf = mf
 }
 
-// MemoryFile implements pgalloc.MemoryFileProvider.MemoryFile.
+// MemoryFile returns the MemoryFile that provides application memory.
 func (k *Kernel) MemoryFile() *pgalloc.MemoryFile {
 	return k.mf
 }
@@ -1550,13 +1660,13 @@ func (ctx *supervisorContext) Value(key any) any {
 		// The supervisor context is global root.
 		return auth.NewRootCredentials(ctx.Kernel.rootUserNamespace)
 	case vfs.CtxRoot:
-		if ctx.Kernel.globalInit == nil {
+		if ctx.Kernel.globalInit == nil || ctx.Kernel.globalInit.Leader() == nil {
 			return vfs.VirtualDentry{}
 		}
 		root := ctx.Kernel.GlobalInit().Leader().MountNamespace().Root(ctx)
 		return root
 	case vfs.CtxMountNamespace:
-		if ctx.Kernel.globalInit == nil {
+		if ctx.Kernel.globalInit == nil || ctx.Kernel.globalInit.Leader() == nil {
 			return nil
 		}
 		mntns := ctx.Kernel.GlobalInit().Leader().MountNamespace()
@@ -1571,8 +1681,6 @@ func (ctx *supervisorContext) Value(key any) any {
 		return limits.NewLimitSet()
 	case pgalloc.CtxMemoryFile:
 		return ctx.Kernel.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return ctx.Kernel
 	case platform.CtxPlatform:
 		return ctx.Kernel
 	case uniqueid.CtxGlobalUniqueID:
@@ -1654,12 +1762,46 @@ func (k *Kernel) CgroupRegistry() *CgroupRegistry {
 	return k.cgroupRegistry
 }
 
+// AddCgroupMount adds the cgroup mounts to the cgroupMountsMap. These cgroup
+// mounts are created during the creation of root container process and the
+// reference ownership is transferred to the kernel.
+func (k *Kernel) AddCgroupMount(ctl string, mnt *CgroupMount) {
+	k.cgroupMountsMapMu.Lock()
+	defer k.cgroupMountsMapMu.Unlock()
+
+	if k.cgroupMountsMap == nil {
+		k.cgroupMountsMap = make(map[string]*CgroupMount)
+	}
+	k.cgroupMountsMap[ctl] = mnt
+}
+
+// GetCgroupMount returns the cgroup mount for the given cgroup controller.
+func (k *Kernel) GetCgroupMount(ctl string) *CgroupMount {
+	k.cgroupMountsMapMu.Lock()
+	defer k.cgroupMountsMapMu.Unlock()
+
+	return k.cgroupMountsMap[ctl]
+}
+
+// releaseCgroupMounts releases the cgroup mounts.
+func (k *Kernel) releaseCgroupMounts(ctx context.Context) {
+	k.cgroupMountsMapMu.Lock()
+	defer k.cgroupMountsMapMu.Unlock()
+
+	for _, m := range k.cgroupMountsMap {
+		m.Mount.DecRef(ctx)
+		m.Root.DecRef(ctx)
+		m.Fs.DecRef(ctx)
+	}
+}
+
 // Release releases resources owned by k.
 //
 // Precondition: This should only be called after the kernel is fully
 // initialized, e.g. after k.Start() has been called.
 func (k *Kernel) Release() {
 	ctx := k.SupervisorContext()
+	k.releaseCgroupMounts(ctx)
 	k.hostMount.DecRef(ctx)
 	k.pipeMount.DecRef(ctx)
 	k.nsfsMount.DecRef(ctx)
@@ -1669,6 +1811,9 @@ func (k *Kernel) Release() {
 	k.timekeeper.Destroy()
 	k.vdso.Release(ctx)
 	k.RootNetworkNamespace().DecRef(ctx)
+	k.rootIPCNamespace.DecRef(ctx)
+	k.rootUTSNamespace.DecRef(ctx)
+	k.cleaupDevGofers()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -1728,6 +1873,8 @@ func (k *Kernel) ReleaseCgroupHierarchy(hid uint32) {
 	}
 }
 
+// ReplaceFSContextRoots updates root and cwd to `newRoot` in the FSContext
+// across all tasks whose old root or cwd were `oldRoot`.
 func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualDentry, newRoot vfs.VirtualDentry) {
 	k.tasks.mu.RLock()
 	oldRootDecRefs := 0
@@ -1755,7 +1902,8 @@ func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualD
 	}
 }
 
-func (k *Kernel) GetUserCounters(uid auth.KUID) *userCounters {
+// GetUserCounters returns the user counters for the given KUID.
+func (k *Kernel) GetUserCounters(uid auth.KUID) *UserCounters {
 	k.userCountersMapMu.Lock()
 	defer k.userCountersMapMu.Unlock()
 
@@ -1763,7 +1911,62 @@ func (k *Kernel) GetUserCounters(uid auth.KUID) *userCounters {
 		return uc
 	}
 
-	uc := &userCounters{}
+	uc := &UserCounters{}
 	k.userCountersMap[uid] = uc
 	return uc
+}
+
+// AddDevGofer initializes the dev gofer connection and starts tracking it.
+// It takes ownership of goferFD.
+func (k *Kernel) AddDevGofer(cid string, goferFD int) error {
+	client, err := devutil.NewGoferClient(k.SupervisorContext(), goferFD)
+	if err != nil {
+		return err
+	}
+
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	if k.devGofers == nil {
+		k.devGofers = make(map[string]*devutil.GoferClient)
+	}
+	k.devGofers[cid] = client
+	return nil
+}
+
+// RemoveDevGofer closes the dev gofer connection, if one exists, and stops
+// tracking it.
+func (k *Kernel) RemoveDevGofer(cid string) {
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	client, ok := k.devGofers[cid]
+	if !ok {
+		return
+	}
+	client.Close()
+	delete(k.devGofers, cid)
+}
+
+func (k *Kernel) getDevGoferClient(cid string) *devutil.GoferClient {
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	return k.devGofers[cid]
+}
+
+func (k *Kernel) cleaupDevGofers() {
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	for _, client := range k.devGofers {
+		client.Close()
+	}
+	k.devGofers = nil
+}
+
+// RegisterContainerName registers a container name for a given container ID.
+func (k *Kernel) RegisterContainerName(cid, containerName string) {
+	k.containerNames[cid] = containerName
+}
+
+// ContainerNameGivenID returns the container name for a given container ID.
+func (k *Kernel) ContainerNameGivenID(cid string) string {
+	return k.containerNames[cid]
 }
