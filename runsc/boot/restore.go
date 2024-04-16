@@ -18,10 +18,13 @@ import (
 	"fmt"
 	"os"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/socket/hostinet"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/state"
@@ -32,9 +35,19 @@ import (
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 )
 
+const (
+	// CheckpointStateFileName is the file within the given image-path's
+	// directory which contains the container's saved state.
+	CheckpointStateFileName = "checkpoint.img"
+	// CheckpointPagesFileName is the file within the given image-path's
+	// directory containing the container's MemoryFile pages.
+	CheckpointPagesFileName = "pages.img"
+)
+
 type restorer struct {
 	container  *containerInfo
 	stateFile  *os.File
+	pagesFile  *os.File
 	deviceFile *os.File
 }
 
@@ -114,12 +127,12 @@ func (r *restorer) restore(l *Loader) error {
 
 	// TODO(b/298078576): Need to process hints here probably
 	mntr := newContainerMounter(&l.root, l.k, l.mountHints, l.sharedMounts, l.productName, l.sandboxID)
-	ctx, err = mntr.configureRestore(ctx)
-	if err != nil {
+
+	fdmap := make(map[vfs.RestoreID]int)
+	mfmap := make(map[string]*pgalloc.MemoryFile)
+	if err := mntr.configureRestore(fdmap, mfmap); err != nil {
 		return fmt.Errorf("configuring filesystem restore: %v", err)
 	}
-
-	fdmap := vfs.RestoreFilesystemFDMapFromContext(ctx)
 	for appFD, fd := range r.container.stdioFDs {
 		key := host.MakeRestoreID(r.container.containerName, appFD)
 		fdmap[key] = fd.Release()
@@ -128,9 +141,11 @@ func (r *restorer) restore(l *Loader) error {
 		key := host.MakeRestoreID(r.container.containerName, customFD.guest)
 		fdmap[key] = customFD.host.FD()
 	}
+	ctx = context.WithValue(ctx, vfs.CtxRestoreFilesystemFDMap, fdmap)
+	ctx = context.WithValue(ctx, pgalloc.CtxMemoryFileMap, mfmap)
 
 	// Load the state.
-	loadOpts := state.LoadOpts{Source: r.stateFile}
+	loadOpts := state.LoadOpts{Source: r.stateFile, PagesFile: r.pagesFile}
 	if err := loadOpts.Load(ctx, l.k, nil, netns.Stack(), time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}); err != nil {
 		return err
 	}
@@ -157,6 +172,16 @@ func (r *restorer) restore(l *Loader) error {
 	if tasks[0].ContainerID() != l.sandboxID { // There must be at least 1 task.
 		for _, task := range tasks {
 			task.RestoreContainerID(l.sandboxID)
+		}
+	}
+
+	// Kill all processes that have been exec'd since they cannot be properly
+	// restored, since the caller is no longer connected.
+	for _, tg := range l.k.RootPIDNamespace().ThreadGroups() {
+		if tg.Leader().Origin == kernel.OriginExec {
+			if err := l.k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)}); err != nil {
+				log.Warningf("Failed to kill exec process after restore: %v", err)
+			}
 		}
 	}
 

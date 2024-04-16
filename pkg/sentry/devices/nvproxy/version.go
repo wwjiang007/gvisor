@@ -125,7 +125,7 @@ type driverABI struct {
 	frontendIoctl   map[uint32]frontendIoctlHandler
 	uvmIoctl        map[uint32]uvmIoctlHandler
 	controlCmd      map[uint32]controlCmdHandler
-	allocationClass map[uint32]allocationClassHandler
+	allocationClass map[nvgpu.ClassID]allocationClassHandler
 }
 
 // abis is a global map containing all supported Nvidia driver ABIs. This is
@@ -155,8 +155,9 @@ func Init() {
 			// with the entirety of the nvproxy functionality at this version.
 			return &driverABI{
 				frontendIoctl: map[uint32]frontendIoctlHandler{
-					nvgpu.NV_ESC_CARD_INFO:                     frontendIoctlSimple, // nv_ioctl_card_info_t
+					nvgpu.NV_ESC_CARD_INFO:                     frontendIoctlSimple, // nv_ioctl_card_info_t array
 					nvgpu.NV_ESC_CHECK_VERSION_STR:             frontendIoctlSimple, // nv_rm_api_version_t
+					nvgpu.NV_ESC_ATTACH_GPUS_TO_FD:             frontendIoctlSimple, // NvU32 array containing GPU IDs
 					nvgpu.NV_ESC_SYS_PARAMS:                    frontendIoctlSimple, // nv_ioctl_sys_params_t
 					nvgpu.NV_ESC_RM_DUP_OBJECT:                 frontendIoctlSimple, // NVOS55_PARAMETERS
 					nvgpu.NV_ESC_RM_SHARE:                      frontendIoctlSimple, // NVOS57_PARAMETERS
@@ -209,6 +210,7 @@ func Init() {
 					nvgpu.NV0000_CTRL_CMD_GPU_GET_MEMOP_ENABLE:              rmControlSimple,
 					nvgpu.NV0000_CTRL_CMD_SYNC_GPU_BOOST_GROUP_INFO:         rmControlSimple,
 					nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS:               rmControlSimple,
+					nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_V2:            rmControlSimple,
 					nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_FABRIC_STATUS:          rmControlSimple,
 					nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_MATRIX:        rmControlSimple,
 					nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_FEATURES:               rmControlSimple,
@@ -283,7 +285,7 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS:                            ctrlSubdevFIFODisableChannels,
 					nvgpu.NV2080_CTRL_CMD_GR_GET_INFO:                                      ctrlSubdevGRGetInfo,
 				},
-				allocationClass: map[uint32]allocationClassHandler{
+				allocationClass: map[nvgpu.ClassID]allocationClassHandler{
 					nvgpu.NV01_ROOT:                 rmAllocSimple[nvgpu.Handle],
 					nvgpu.NV01_ROOT_NON_PRIV:        rmAllocSimple[nvgpu.Handle],
 					nvgpu.NV01_MEMORY_SYSTEM:        rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS],
@@ -419,7 +421,7 @@ func SupportedIoctls(version DriverVersion) (frontendIoctls map[uint32]struct{},
 	}
 	allocClasses = make(map[uint32]struct{})
 	for class := range abi.allocationClass {
-		allocClasses[class] = struct{}{}
+		allocClasses[uint32(class)] = struct{}{}
 	}
 	return
 }

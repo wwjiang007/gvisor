@@ -32,6 +32,7 @@ const (
 	NV_ESC_ALLOC_OS_EVENT     = NV_IOCTL_BASE + 6
 	NV_ESC_FREE_OS_EVENT      = NV_IOCTL_BASE + 7
 	NV_ESC_CHECK_VERSION_STR  = NV_IOCTL_BASE + 10
+	NV_ESC_ATTACH_GPUS_TO_FD  = NV_IOCTL_BASE + 12
 	NV_ESC_SYS_PARAMS         = NV_IOCTL_BASE + 14
 	NV_ESC_WAIT_OPEN_COMPLETE = NV_IOCTL_BASE + 18
 
@@ -126,7 +127,7 @@ type NVOS02Parameters struct {
 	HRoot         Handle
 	HObjectParent Handle
 	HObjectNew    Handle
-	HClass        uint32
+	HClass        ClassID
 	Flags         uint32
 	Pad0          [4]byte
 	PMemory       P64 // address of application mapping, without indirection
@@ -176,7 +177,7 @@ type NVOS21Parameters struct {
 	HRoot         Handle
 	HObjectParent Handle
 	HObjectNew    Handle
-	HClass        uint32
+	HClass        ClassID
 	PAllocParms   P64
 	ParamsSize    uint32
 	Status        uint32
@@ -372,7 +373,7 @@ type NVOS64Parameters struct {
 	HRoot            Handle
 	HObjectParent    Handle
 	HObjectNew       Handle
-	HClass           uint32
+	HClass           ClassID
 	PAllocParms      P64
 	PRightsRequested P64
 	ParamsSize       uint32

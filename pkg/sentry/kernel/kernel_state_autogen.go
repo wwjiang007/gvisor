@@ -422,7 +422,6 @@ func (k *Kernel) StateFields() []string {
 		"cgroupMountsMap",
 		"userCountersMap",
 		"MaxFDLimit",
-		"containerNames",
 	}
 }
 
@@ -471,7 +470,6 @@ func (k *Kernel) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(35, &k.cgroupMountsMap)
 	stateSinkObject.Save(36, &k.userCountersMap)
 	stateSinkObject.Save(37, &k.MaxFDLimit)
-	stateSinkObject.Save(38, &k.containerNames)
 }
 
 func (k *Kernel) afterLoad(context.Context) {}
@@ -515,7 +513,6 @@ func (k *Kernel) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(35, &k.cgroupMountsMap)
 	stateSourceObject.Load(36, &k.userCountersMap)
 	stateSourceObject.Load(37, &k.MaxFDLimit)
-	stateSourceObject.Load(38, &k.containerNames)
 	stateSourceObject.LoadValue(20, new([]tcpip.Endpoint), func(y any) { k.loadDanglingEndpoints(ctx, y.([]tcpip.Endpoint)) })
 }
 
@@ -1324,6 +1321,7 @@ func (t *Task) StateFields() []string {
 		"memCgID",
 		"userCounters",
 		"sessionKeyring",
+		"Origin",
 	}
 }
 
@@ -1403,6 +1401,7 @@ func (t *Task) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(64, &t.memCgID)
 	stateSinkObject.Save(65, &t.userCounters)
 	stateSinkObject.Save(66, &t.sessionKeyring)
+	stateSinkObject.Save(67, &t.Origin)
 }
 
 // +checklocksignore
@@ -1472,6 +1471,7 @@ func (t *Task) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(64, &t.memCgID)
 	stateSourceObject.Load(65, &t.userCounters)
 	stateSourceObject.Load(66, &t.sessionKeyring)
+	stateSourceObject.Load(67, &t.Origin)
 	stateSourceObject.LoadValue(32, new(*Task), func(y any) { t.loadPtraceTracer(ctx, y.(*Task)) })
 	stateSourceObject.LoadValue(48, new(*taskSeccomp), func(y any) { t.loadSeccomp(ctx, y.(*taskSeccomp)) })
 	stateSourceObject.AfterLoad(func() { t.afterLoad(ctx) })

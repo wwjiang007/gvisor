@@ -234,9 +234,6 @@ type Config struct {
 	// for the duration of the container execution.
 	TraceFile string `flag:"trace"`
 
-	// RestoreFile is the path to the saved container image.
-	RestoreFile string
-
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
 	// to the same underlying network device. This allows netstack to better
 	// scale for high throughput use cases.
@@ -292,7 +289,7 @@ type Config struct {
 	// each.
 	FDLimit int `flag:"fdlimit"`
 
-	// DCache sets the global dirent cache size. If zero, per-mount caches are
+	// DCache sets the global dirent cache size. If negative, per-mount caches are
 	// used.
 	DCache int `flag:"dcache"`
 
@@ -350,6 +347,9 @@ type Config struct {
 	// TestOnlyAutosaveImagePath if not empty enables auto save for syscall tests
 	// and stores the directory path to the saved state file.
 	TestOnlyAutosaveImagePath string `flag:"TESTONLY-autosave-image-path"`
+
+	// TestOnlyAutosaveResume indicates save resume for syscall tests.
+	TestOnlyAutosaveResume bool `flag:"TESTONLY-autosave-resume"`
 }
 
 func (c *Config) validate() error {

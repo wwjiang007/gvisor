@@ -213,6 +213,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		IPCNamespace:         proc.Kernel.RootIPCNamespace(),
 		ContainerID:          args.ContainerID,
 		PIDNamespace:         pidns,
+		Origin:               kernel.OriginExec,
 	}
 	if initArgs.MountNamespace != nil {
 		// initArgs must hold a reference on MountNamespace, which will
@@ -266,8 +267,9 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		initArgs.Filename = resolved
 	}
 
-	containerName := proc.Kernel.ContainerNameGivenID(args.ContainerID)
-	ttyFile, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fdMap, containerName)
+	// TODO(gvisor.dev/issue/1956): Container name is not really needed because
+	// exec processes are not restored, but add it for completeness.
+	ttyFile, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fdMap, "")
 	if err != nil {
 		return nil, 0, nil, err
 	}

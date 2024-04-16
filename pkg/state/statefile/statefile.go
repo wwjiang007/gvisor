@@ -99,12 +99,18 @@ const (
 	CompressionLevelFlateBestSpeed = CompressionLevel("flate-best-speed")
 	// CompressionLevelNone represents the absence of any compression on an image.
 	CompressionLevelNone = CompressionLevel("none")
+	// CompressionLevelDefault represents the default compression level.
+	CompressionLevelDefault = CompressionLevelFlateBestSpeed
 )
 
 // Options is statefile options.
 type Options struct {
 	// Compression is an image compression type/level.
 	Compression CompressionLevel
+
+	// Resume indicates if the sandbox process should continue running
+	// after checkpointing.
+	Resume bool
 }
 
 // WriteToMetadata save options to the metadata storage.  Method returns the
