@@ -239,6 +239,12 @@ type Config struct {
 	// scale for high throughput use cases.
 	NumNetworkChannels int `flag:"num-network-channels"`
 
+	// NetworkProcessorsPerChannel controls the number of goroutines used to
+	// handle packets on a single network channel. A higher number can help handle
+	// many simultaneous connections. If this is 0, runsc will divide GOMAXPROCS
+	// evenly among each network channel.
+	NetworkProcessorsPerChannel int `flag:"network-processors-per-channel"`
+
 	// Rootless allows the sandbox to be started with a user that is not root.
 	// Defense in depth measures are weaker in rootless mode. Specifically, the
 	// sandbox and Gofer process run as root inside a user namespace with root
@@ -309,6 +315,12 @@ type Config struct {
 	// `docker run --gpus` directly. For backward compatibility, this has the
 	// effect of injecting nvidia-container-runtime-hook as a prestart hook.
 	NVProxyDocker bool `flag:"nvproxy-docker"`
+
+	// NVProxyDriverVersion is the version of the NVIDIA driver ABI to use.
+	// If empty, it is autodetected from the installed NVIDIA driver.
+	// It can also be set to the special value "latest" to force the use of
+	// the latest supported NVIDIA driver ABI.
+	NVProxyDriverVersion string `flag:"nvproxy-driver-version"`
 
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`

@@ -16,9 +16,7 @@ package nvproxy
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -68,6 +66,7 @@ func (fd *uvmFD) InvalidateUnsavable(ctx context.Context) error {
 	return nil
 }
 
+// +stateify savable
 type uvmFDMemmapFile struct {
 	fd *uvmFD
 }
@@ -83,8 +82,7 @@ func (mf *uvmFDMemmapFile) DecRef(fr memmap.FileRange) {
 // MapInternal implements memmap.File.MapInternal.
 func (mf *uvmFDMemmapFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	// TODO(jamieliu): make an attempt with MAP_FIXED_NOREPLACE?
-	log.Traceback("nvproxy: rejecting uvmFDMemmapFile.MapInternal")
-	return safemem.BlockSeq{}, linuxerr.EINVAL
+	return safemem.BlockSeq{}, memmap.BufferedIOFallbackErr{}
 }
 
 // FD implements memmap.File.FD.

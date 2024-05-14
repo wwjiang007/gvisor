@@ -16,6 +16,7 @@ package mm
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -204,6 +205,14 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 			panic(fmt.Sprintf("initial vma %v does not cover start of ar %v", vseg.Range(), ar))
 		}
 	}
+	var pfdrs *pendingFileDecRefs
+	defer func() { // must be a closure to avoid evaluating pfdrs immediately
+		pfdrs.Cleanup()
+	}()
+	var unmapAR hostarch.AddrRange
+	defer func() {
+		mm.unmapASLocked(unmapAR)
+	}()
 
 	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	opts := pgalloc.AllocOpts{Kind: usage.Anonymous, Dir: pgalloc.BottomUp, MemCgID: memCgID}
@@ -217,7 +226,6 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 
 	// Limit the range we allocate to ar, aligned to privateAllocUnit.
 	maskAR := privateAligned(ar)
-	didUnmapAS := false
 	// The range in which we iterate vmas and pmas is still limited to ar, to
 	// ensure that we don't allocate or COW-break a pma we don't need.
 	pseg, pgap := mm.pmas.Find(ar.Start)
@@ -387,13 +395,6 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					if fr.Length() == 0 {
 						return pstart, pseg.PrevGap(), err
 					}
-					// Unmap all of maskAR, not just copyAR, to minimize host
-					// syscalls. AddressSpace mappings must be removed before
-					// oldpma.file.DecRef().
-					if !didUnmapAS {
-						mm.unmapASLocked(maskAR)
-						didUnmapAS = true
-					}
 					// Replace the pma with a copy in the part of the address
 					// range where copying was successful. This doesn't change
 					// RSS.
@@ -403,7 +404,8 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						pstart = pmaIterator{} // iterators invalidated
 					}
 					oldpma = pseg.ValuePtr()
-					oldpma.file.DecRef(pseg.fileRange())
+					unmapAR = joinAddrRanges(unmapAR, copyAR)
+					pfdrs = appendPendingFileDecRef(pfdrs, oldpma.file, pseg.fileRange())
 					oldpma.file = mm.mf
 					oldpma.off = fr.Start
 					oldpma.translatePerms = hostarch.AnyAccess
@@ -455,18 +457,15 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}
 					// Remove the part of the existing pma covered by new
 					// Translations, then insert new pmas. This doesn't change
-					// RSS. Note that we don't need to call unmapASLocked: any
-					// existing AddressSpace mappings are still valid (though
-					// less permissive than the new pmas indicate) until
-					// Invalidate is called, and will be replaced by future
-					// calls to mapASLocked.
+					// RSS.
 					if len(ts) == 0 {
 						return pstart, pseg.PrevGap(), err
 					}
 					transMR := memmap.MappableRange{ts[0].Source.Start, ts[len(ts)-1].Source.End}
 					transAR := vseg.addrRangeOf(transMR)
 					pseg = mm.pmas.Isolate(pseg, transAR)
-					pseg.ValuePtr().file.DecRef(pseg.fileRange())
+					unmapAR = joinAddrRanges(unmapAR, transAR)
+					pfdrs = appendPendingFileDecRef(pfdrs, pseg.ValuePtr().file, pseg.fileRange())
 					pgap = mm.pmas.Remove(pseg)
 					pstart = pmaIterator{} // iterators invalidated
 					for _, t := range ts {
@@ -797,75 +796,13 @@ func (mm *MemoryManager) movePMAsLocked(oldAR, newAR hostarch.AddrRange) {
 	mm.unmapASLocked(oldAR)
 }
 
-// getPMAInternalMappingsLocked ensures that pmas for all addresses in ar have
-// cached internal mappings. It returns:
-//
-//   - An iterator to the gap after the last pma with internal mappings
-//     containing an address in ar. If internal mappings exist for no addresses in
-//     ar, the iterator is to a gap that begins before ar.Start.
-//
-//   - An error that is non-nil if internal mappings exist for only a subset of
-//     ar.
-//
-// Preconditions:
-//   - mm.activeMu must be locked for writing.
-//   - pseg.Range().Contains(ar.Start).
-//   - pmas must exist for all addresses in ar.
-//   - ar.Length() != 0.
-//
-// Postconditions: getPMAInternalMappingsLocked does not invalidate iterators
-// into mm.pmas.
-func (mm *MemoryManager) getPMAInternalMappingsLocked(pseg pmaIterator, ar hostarch.AddrRange) (pmaGapIterator, error) {
-	if checkInvariants {
-		if !ar.WellFormed() || ar.Length() == 0 {
-			panic(fmt.Sprintf("invalid ar: %v", ar))
-		}
-		if !pseg.Range().Contains(ar.Start) {
-			panic(fmt.Sprintf("initial pma %v does not cover start of ar %v", pseg.Range(), ar))
-		}
-	}
-
-	for {
-		if err := pseg.getInternalMappingsLocked(); err != nil {
-			return pseg.PrevGap(), err
-		}
-		if ar.End <= pseg.End() {
-			return pseg.NextGap(), nil
-		}
-		pseg, _ = pseg.NextNonEmpty()
-	}
-}
-
-// getVecPMAInternalMappingsLocked ensures that pmas for all addresses in ars
-// have cached internal mappings. It returns the subset of ars for which
-// internal mappings exist. If this is not equal to ars, it returns a non-nil
-// error explaining why.
-//
-// Preconditions:
-//   - mm.activeMu must be locked for writing.
-//   - pmas must exist for all addresses in ar.
-//
-// Postconditions: getVecPMAInternalMappingsLocked does not invalidate iterators
-// into mm.pmas.
-func (mm *MemoryManager) getVecPMAInternalMappingsLocked(ars hostarch.AddrRangeSeq) (hostarch.AddrRangeSeq, error) {
-	for arsit := ars; !arsit.IsEmpty(); arsit = arsit.Tail() {
-		ar := arsit.Head()
-		if ar.Length() == 0 {
-			continue
-		}
-		if pend, err := mm.getPMAInternalMappingsLocked(mm.pmas.FindSegment(ar.Start), ar); err != nil {
-			return truncatedAddrRangeSeq(ars, arsit, pend.Start()), err
-		}
-	}
-	return ars, nil
-}
-
-// internalMappingsLocked returns internal mappings for addresses in ar.
+// internalMappingsLocked returns cached internal mappings for addresses in ar.
 //
 // Preconditions:
 //   - mm.activeMu must be locked.
-//   - Internal mappings must have been previously established for all addresses
-//     in ar.
+//   - While mm.activeMu was locked, a call to
+//     existingPMAsLocked(needInternalMappings=true) succeeded for all
+//     addresses in ar.
 //   - ar.Length() != 0.
 //   - pseg.Range().Contains(ar.Start).
 func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.AddrRange) safemem.BlockSeq {
@@ -899,12 +836,14 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 	return safemem.BlockSeqFromSlice(ims)
 }
 
-// vecInternalMappingsLocked returns internal mappings for addresses in ars.
+// vecInternalMappingsLocked returns cached internal mappings for addresses in
+// ars.
 //
 // Preconditions:
 //   - mm.activeMu must be locked.
-//   - Internal mappings must have been previously established for all addresses
-//     in ars.
+//   - While mm.activeMu was locked, a call to
+//     existingVecPMAsLocked(needInternalMappings=true) succeeded for all
+//     addresses in ars.
 func (mm *MemoryManager) vecInternalMappingsLocked(ars hostarch.AddrRangeSeq) safemem.BlockSeq {
 	var ims []safemem.Block
 	for ; !ars.IsEmpty(); ars = ars.Tail() {
@@ -1053,4 +992,73 @@ func (pseg pmaIterator) fileRangeOf(ar hostarch.AddrRange) memmap.FileRange {
 	pma := pseg.ValuePtr()
 	pstart := pseg.Start()
 	return memmap.FileRange{pma.off + uint64(ar.Start-pstart), pma.off + uint64(ar.End-pstart)}
+}
+
+// joinAddrRanges returns the smallest hostarch.AddrRange that is a superset of
+// both ar1 and ar2. If either ar1 or ar2 have length 0, joinAddrRanges returns
+// the other range. If both ar1 and ar2 have length 0, joinAddrRanges returns
+// an unspecified range with length 0.
+func joinAddrRanges(ar1, ar2 hostarch.AddrRange) hostarch.AddrRange {
+	if ar1.Length() == 0 {
+		return ar2
+	}
+	if ar2.Length() == 0 {
+		return ar1
+	}
+	ar := ar1
+	if ar.Start > ar2.Start {
+		ar.Start = ar2.Start
+	}
+	if ar.End < ar2.End {
+		ar.End = ar2.End
+	}
+	if checkInvariants {
+		if !ar.IsSupersetOf(ar1) || !ar.IsSupersetOf(ar2) {
+			panic(fmt.Sprintf("%v is not a superset of both %v and %v", ar, ar1, ar2))
+		}
+	}
+	return ar
+}
+
+// pendingFileDecRefs accumulates released memmap.FileRange references so that
+// calls to memmap.File.DecRef() can occur without holding locks.
+type pendingFileDecRefs struct {
+	slice []pendingFileDecRef
+}
+
+type pendingFileDecRef struct {
+	file memmap.File
+	fr   memmap.FileRange
+}
+
+var pendingFileDecRefsPool = sync.Pool{
+	New: func() any {
+		return &pendingFileDecRefs{}
+	},
+}
+
+func appendPendingFileDecRef(pfdrs *pendingFileDecRefs, file memmap.File, fr memmap.FileRange) *pendingFileDecRefs {
+	if pfdrs == nil {
+		pfdrs = pendingFileDecRefsPool.Get().(*pendingFileDecRefs)
+	}
+	pfdrs.slice = append(pfdrs.slice, pendingFileDecRef{file, fr})
+	return pfdrs
+}
+
+// Cleanup releases all references accumulated by pfdrs and releases ownership
+// of pfdrs. pfdrs may be nil.
+//
+// Preconditions: No AddressSpace ranges may be awaiting unmapping (since such
+// ranges may refer to memmap.File pages that will be dropped.)
+func (pfdrs *pendingFileDecRefs) Cleanup() {
+	if pfdrs == nil {
+		return
+	}
+	for i := range pfdrs.slice {
+		pfdr := &pfdrs.slice[i]
+		pfdr.file.DecRef(pfdr.fr)
+		pfdr.file = nil // allow GC
+	}
+	pfdrs.slice = pfdrs.slice[:0]
+	pendingFileDecRefsPool.Put(pfdrs)
 }

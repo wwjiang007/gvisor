@@ -36,3 +36,27 @@ func SeqAtomicTryLoadClock(seq *sync.SeqCount, epoch sync.SeqCountEpoch, ptr *Cl
 	ok = seq.ReadOk(epoch)
 	return
 }
+
+// SeqAtomicStore sets *ptr to a copy of val, ensuring that any racing reader
+// critical sections are forced to retry.
+//
+//go:nosplit
+func SeqAtomicStoreClock(seq *sync.SeqCount, ptr *Clock, val Clock) {
+	seq.BeginWrite()
+	SeqAtomicStoreSeqedClock(ptr, val)
+	seq.EndWrite()
+}
+
+// SeqAtomicStoreSeqed sets *ptr to a copy of val.
+//
+// Preconditions: ptr is protected by a SeqCount that will be in a writer
+// critical section throughout the call to SeqAtomicStore.
+//
+//go:nosplit
+func SeqAtomicStoreSeqedClock(ptr *Clock, val Clock) {
+	if sync.RaceEnabled {
+		gohacks.Memmove(unsafe.Pointer(ptr), unsafe.Pointer(&val), unsafe.Sizeof(val))
+	} else {
+		*ptr = val
+	}
+}

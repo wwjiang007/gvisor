@@ -72,10 +72,6 @@ func Filters() seccomp.SyscallRules {
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
-				seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS21Parameters)),
-			},
-			seccomp.PerArg{
-				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(frontendIoctlCmd(nvgpu.NV_ESC_RM_ALLOC, nvgpu.SizeofNVOS64Parameters)),
 			},
 			seccomp.PerArg{
@@ -165,6 +161,14 @@ func Filters() seccomp.SyscallRules {
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(nvgpu.UVM_DISABLE_READ_DUPLICATION),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_TOOLS_READ_PROCESS_MEMORY),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_TOOLS_WRITE_PROCESS_MEMORY),
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},

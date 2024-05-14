@@ -71,6 +71,27 @@ const (
 	NV0000_CTRL_CMD_SYSTEM_GET_FEATURES        = 0x1f0
 )
 
+// From src/common/sdk/nvidia/inc/ctrl/ctrl0000/ctrl0000unix.h:
+const (
+	NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD = 0x3d05
+)
+
+// +marshal
+type NV0000_CTRL_OS_UNIX_EXPORT_OBJECT struct {
+	Type uint32 // enum NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TYPE
+	// These fields are inside union `data`, in struct `rmObject`.
+	HDevice Handle
+	HParent Handle
+	HObject Handle
+}
+
+// +marshal
+type NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS struct {
+	Object NV0000_CTRL_OS_UNIX_EXPORT_OBJECT
+	FD     int32
+	Flags  uint32
+}
+
 // +marshal
 type NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_PARAMS struct {
 	SizeOfStrings            uint32
@@ -258,6 +279,13 @@ const (
 	NV503C_CTRL_CMD_REGISTER_VIDMEM   = 0x503c0104
 	NV503C_CTRL_CMD_UNREGISTER_VIDMEM = 0x503c0105
 )
+
+// +marshal
+type NV503C_CTRL_REGISTER_VA_SPACE_PARAMS struct {
+	HVASpace     Handle
+	Pad          [4]byte
+	VASpaceToken uint64
+}
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrl83de/ctrl83dedebug.h:
 const (

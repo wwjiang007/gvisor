@@ -423,14 +423,28 @@ func New(conf *config.Config, args Args) (*Container, error) {
 // Start starts running the containerized process inside the sandbox.
 func (c *Container) Start(conf *config.Config) error {
 	log.Debugf("Start container, cid: %s", c.ID)
+	return c.startImpl(conf, "start", c.Sandbox.StartRoot, c.Sandbox.StartSubcontainer)
+}
 
+// Restore takes a container and replaces its kernel and file system
+// to restore a container from its state file.
+func (c *Container) Restore(conf *config.Config, imagePath string, direct bool) error {
+	log.Debugf("Restore container, cid: %s", c.ID)
+
+	restore := func(conf *config.Config) error {
+		return c.Sandbox.Restore(conf, c.ID, imagePath, direct)
+	}
+	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
+}
+
+func (c *Container) startImpl(conf *config.Config, action string, startRoot func(conf *config.Config) error, startSub func(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []boot.GoferMountConf) error) error {
 	if err := c.Saver.lock(BlockAcquire); err != nil {
 		return err
 	}
 	unlock := cleanup.Make(c.Saver.UnlockOrDie)
 	defer unlock.Clean()
 
-	if err := c.requireStatus("start", Created); err != nil {
+	if err := c.requireStatus(action, Created); err != nil {
 		return err
 	}
 
@@ -441,7 +455,7 @@ func (c *Container) Start(conf *config.Config) error {
 	}
 
 	if isRoot(c.Spec) {
-		if err := c.Sandbox.StartRoot(conf); err != nil {
+		if err := startRoot(conf); err != nil {
 			return err
 		}
 	} else {
@@ -492,7 +506,7 @@ func (c *Container) Start(conf *config.Config) error {
 				stdios = []*os.File{os.Stdin, os.Stdout, os.Stderr}
 			}
 
-			return c.Sandbox.StartSubcontainer(c.Spec, conf, c.ID, stdios, goferFiles, goferFilestores, devIOFile, goferConfs)
+			return startSub(c.Spec, conf, c.ID, stdios, goferFiles, goferFilestores, devIOFile, goferConfs)
 		}); err != nil {
 			return err
 		}
@@ -521,32 +535,6 @@ func (c *Container) Start(conf *config.Config) error {
 	// Set container's oom_score_adj to the gofer since it is dedicated to
 	// the container, in case the gofer uses up too much memory.
 	return c.adjustGoferOOMScoreAdj()
-}
-
-// Restore takes a container and replaces its kernel and file system
-// to restore a container from its state file.
-func (c *Container) Restore(conf *config.Config, imagePath string) error {
-	log.Debugf("Restore container, cid: %s", c.ID)
-	if err := c.Saver.lock(BlockAcquire); err != nil {
-		return err
-	}
-	defer c.Saver.UnlockOrDie()
-
-	if err := c.requireStatus("restore", Created); err != nil {
-		return err
-	}
-
-	// "If any prestart hook fails, the runtime MUST generate an error,
-	// stop and destroy the container" -OCI spec.
-	if c.Spec.Hooks != nil && len(c.Spec.Hooks.StartContainer) > 0 {
-		log.Warningf("StartContainer hook skipped because running inside container namespace is not supported")
-	}
-
-	if err := c.Sandbox.Restore(conf, c.ID, imagePath); err != nil {
-		return err
-	}
-	c.changeStatus(Running)
-	return c.saveLocked()
 }
 
 // Run is a helper that calls Create + Start + Wait.
@@ -714,12 +702,12 @@ func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 
 // Checkpoint sends the checkpoint call to the container.
 // The statefile will be written to f, the file at the specified image-path.
-func (c *Container) Checkpoint(imagePath string, options statefile.Options) error {
+func (c *Container) Checkpoint(imagePath string, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
 	log.Debugf("Checkpoint container, cid: %s", c.ID)
 	if err := c.requireStatus("checkpoint", Created, Running, Paused); err != nil {
 		return err
 	}
-	return c.Sandbox.Checkpoint(c.ID, imagePath, options)
+	return c.Sandbox.Checkpoint(c.ID, imagePath, sfOpts, mfOpts)
 }
 
 // Pause suspends the container and its kernel.
@@ -1404,9 +1392,7 @@ func (c *Container) changeStatus(s Status) {
 		}
 
 	case Stopped:
-		if c.Status != Creating && c.Status != Created && c.Status != Running && c.Status != Stopped {
-			panic(fmt.Sprintf("invalid state transition: %v => %v", c.Status, s))
-		}
+		// All states can transition to Stopped.
 
 	default:
 		panic(fmt.Sprintf("invalid new state: %v", s))
@@ -1993,4 +1979,20 @@ func nvproxySetupAfterGoferUserns(spec *specs.Spec, conf *config.Config, goferCm
 		}
 		return nil
 	}, nil
+}
+
+// CheckStopped checks if the container is stopped and updates its status.
+func (c *Container) CheckStopped() {
+	if state, err := c.Sandbox.ContainerRuntimeState(c.ID); err != nil {
+		log.Warningf("Cannot find if container %v exists, checking if sandbox %v is running, err: %v", c.ID, c.Sandbox.ID, err)
+		if !c.IsSandboxRunning() {
+			log.Warningf("Sandbox isn't running anymore, marking container %v as stopped:", c.ID)
+			c.changeStatus(Stopped)
+		}
+	} else {
+		if state == boot.RuntimeStateStopped {
+			log.Warningf("Container %v is stopped", c.ID)
+			c.changeStatus(Stopped)
+		}
+	}
 }

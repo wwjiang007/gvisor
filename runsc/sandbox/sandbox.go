@@ -41,12 +41,14 @@ import (
 	"gvisor.dev/gvisor/pkg/control/client"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/coverage"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -442,8 +444,8 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string) error {
-	log.Debugf("Restore sandbox %q", s.ID)
+func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string, direct bool) error {
+	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
 	stateFileName := path.Join(imagePath, boot.CheckpointStateFileName)
 	sf, err := os.Open(stateFileName)
@@ -458,12 +460,23 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string) err
 		},
 	}
 
-	// If the image file exists, we must pass it in.
+	// If the pages file exists, we must pass it in.
 	pagesFileName := path.Join(imagePath, boot.CheckpointPagesFileName)
-	if pf, err := os.Open(pagesFileName); err == nil {
+	pagesReadFlags := os.O_RDONLY
+	if direct {
+		// The contents are page-aligned, so it can be opened with O_DIRECT.
+		pagesReadFlags |= syscall.O_DIRECT
+	}
+	if pf, err := os.OpenFile(pagesFileName, pagesReadFlags, 0); err == nil {
 		defer pf.Close()
+		pagesMetadataFileName := path.Join(imagePath, boot.CheckpointPagesMetadataFileName)
+		pmf, err := os.Open(pagesMetadataFileName)
+		if err != nil {
+			return fmt.Errorf("opening restore image file %q failed: %v", pagesMetadataFileName, err)
+		}
+		defer pmf.Close()
 		opt.HavePagesFile = true
-		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
+		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf, pf)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("opening restore image file %q failed: %v", pagesFileName, err)
 	}
@@ -474,7 +487,7 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string) err
 	} else if deviceFile != nil {
 		defer deviceFile.Close()
 		opt.HaveDeviceFile = true
-		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile)
+		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
 	}
 
 	conn, err := s.sandboxConnect()
@@ -493,6 +506,44 @@ func (s *Sandbox) Restore(conf *config.Config, cid string, imagePath string) err
 		return fmt.Errorf("restoring container %q: %v", cid, err)
 	}
 
+	return nil
+}
+
+// RestoreSubcontainer sends the restore call for a sub-container in the sandbox.
+func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestoreFiles []*os.File, devIOFile *os.File, goferMountConf []boot.GoferMountConf) error {
+	log.Debugf("Restore sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.load())
+
+	if err := s.configureStdios(conf, stdios); err != nil {
+		return err
+	}
+	s.fixPidns(spec)
+
+	// The payload contains (in this specific order):
+	// * stdin/stdout/stderr (optional: only present when not using TTY)
+	// * The subcontainer's overlay filestore files (optional: only present when
+	//   host file backed overlay is configured)
+	// * Gofer files.
+	payload := urpc.FilePayload{}
+	payload.Files = append(payload.Files, stdios...)
+	payload.Files = append(payload.Files, goferFilestoreFiles...)
+	if devIOFile != nil {
+		payload.Files = append(payload.Files, devIOFile)
+	}
+	payload.Files = append(payload.Files, goferFiles...)
+
+	// Start running the container.
+	args := boot.StartArgs{
+		Spec:                 spec,
+		Conf:                 conf,
+		CID:                  cid,
+		NumGoferFilestoreFDs: len(goferFilestoreFiles),
+		IsDevIoFilePresent:   devIOFile != nil,
+		GoferMountConfs:      goferMountConf,
+		FilePayload:          payload,
+	}
+	if err := s.call(boot.ContMgrRestoreSubcontainer, &args, nil); err != nil {
+		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
+	}
 	return nil
 }
 
@@ -722,9 +773,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			return err
 		}
 	}
-	if err := donations.DonateDebugLogFile("profiling-metrics-fd", conf.ProfilingMetricsLog, "metrics", test); err != nil {
-		return err
-	}
 
 	// Relay all the config flags to the sandbox process.
 	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
@@ -809,7 +857,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if deviceFile, err := gPlatform.OpenDevice(conf.PlatformDevicePath); err != nil {
 		return fmt.Errorf("opening device file for platform %q: %v", conf.Platform, err)
 	} else if deviceFile != nil {
-		donations.DonateAndClose("device-fd", deviceFile)
+		donations.DonateAndClose("device-fd", deviceFile.ReleaseToFile("device file"))
 	}
 
 	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff
@@ -841,11 +889,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	if specutils.NVProxyEnabled(args.Spec, conf) {
-		nvidiaDriverVersion, err := nvproxy.HostDriverVersion()
+		version, err := getNvproxyDriverVersion(conf)
 		if err != nil {
 			return fmt.Errorf("failed to get Nvidia driver version: %w", err)
 		}
-		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+nvidiaDriverVersion)
+		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+version)
 	}
 
 	// Joins the network namespace if network is enabled. the sandbox talks
@@ -1025,6 +1073,15 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// Note: this must be done right after "cmd.SysProcAttr.Ctty" is set above
 	// because it relies on stdin being the next FD donated.
 	donations.Donate("stdio-fds", stdios[:]...)
+	if conf.ProfilingMetricsLog == "-" {
+		donations.Donate("profiling-metrics-fd", stdios[1])
+		cmd.Args = append(cmd.Args, "--profiling-metrics-fd-lossy=true")
+	} else if conf.ProfilingMetricsLog != "" {
+		if err := donations.DonateDebugLogFile("profiling-metrics-fd", conf.ProfilingMetricsLog, "metrics", test); err != nil {
+			return err
+		}
+		cmd.Args = append(cmd.Args, "--profiling-metrics-fd-lossy=false")
+	}
 
 	totalSysMem, err := totalSystemMemory()
 	if err != nil {
@@ -1268,8 +1325,8 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
 // The statefile will be written to f.
-func (s *Sandbox) Checkpoint(cid string, imagePath string, options statefile.Options) error {
-	log.Debugf("Checkpoint sandbox %q, options %+v", s.ID, options)
+func (s *Sandbox) Checkpoint(cid string, imagePath string, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
+	log.Debugf("Checkpoint sandbox %q, statefile options %+v, MemoryFile options %+v", s.ID, sfOpts, mfOpts)
 
 	stateFilePath := filepath.Join(imagePath, boot.CheckpointStateFileName)
 	sf, err := os.OpenFile(stateFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
@@ -1279,24 +1336,32 @@ func (s *Sandbox) Checkpoint(cid string, imagePath string, options statefile.Opt
 	defer sf.Close()
 
 	opt := control.SaveOpts{
-		Metadata: options.WriteToMetadata(map[string]string{}),
+		Metadata:           sfOpts.WriteToMetadata(map[string]string{}),
+		MemoryFileSaveOpts: mfOpts,
 		FilePayload: urpc.FilePayload{
 			Files: []*os.File{sf},
 		},
-		Resume: options.Resume,
+		Resume: sfOpts.Resume,
 	}
 
 	// When there is no compression, MemoryFile contents are page-aligned.
 	// It is beneficial to store them separately so certain optimizations can be
-	// applied during restore.
-	if options.Compression == statefile.CompressionLevelNone {
+	// applied during restore. See Restore().
+	if sfOpts.Compression == statefile.CompressionLevelNone {
 		pagesFilePath := filepath.Join(imagePath, boot.CheckpointPagesFileName)
+		// TODO(b/327603247): Implement optional async O_DIRECT write.
 		pf, err := os.OpenFile(pagesFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 		if err != nil {
 			return fmt.Errorf("creating checkpoint pages file %q: %w", pagesFilePath, err)
 		}
 		defer pf.Close()
-		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
+		pagesMetadataFilePath := filepath.Join(imagePath, boot.CheckpointPagesMetadataFileName)
+		pmf, err := os.OpenFile(pagesMetadataFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+		if err != nil {
+			return fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
+		}
+		defer pmf.Close()
+		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf, pf)
 		opt.HavePagesFile = true
 	}
 
@@ -1380,14 +1445,12 @@ func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Sna
 // IsRunning returns true if the sandbox or gofer process is running.
 func (s *Sandbox) IsRunning() bool {
 	pid := s.Pid.load()
-	if pid != 0 {
-		// Send a signal 0 to the sandbox process.
-		if err := unix.Kill(pid, 0); err == nil {
-			// Succeeded, process is running.
-			return true
-		}
+	if pid == 0 {
+		return false
 	}
-	return false
+	// Send a signal 0 to the sandbox process. If it succeeds, the sandbox
+	// process is running.
+	return unix.Kill(pid, 0) == nil
 }
 
 // Stacks collects and returns all stacks for the sandbox.
@@ -1543,7 +1606,7 @@ func (s *Sandbox) configureStdios(conf *config.Config, stdios []*os.File) error 
 // deviceFileForPlatform opens the device file for the given platform. If the
 // platform does not need a device file, then nil is returned.
 // devicePath may be empty to use a sane platform-specific default.
-func deviceFileForPlatform(name, devicePath string) (*os.File, error) {
+func deviceFileForPlatform(name, devicePath string) (*fd.FD, error) {
 	p, err := platform.Lookup(name)
 	if err != nil {
 		return nil, err
@@ -1554,6 +1617,21 @@ func deviceFileForPlatform(name, devicePath string) (*os.File, error) {
 		return nil, fmt.Errorf("opening device file for platform %q: %w", name, err)
 	}
 	return f, nil
+}
+
+// getNvproxyDriverVersion returns the NVIDIA driver ABI version to use by
+// nvproxy.
+func getNvproxyDriverVersion(conf *config.Config) (string, error) {
+	switch conf.NVProxyDriverVersion {
+	case "":
+		return nvproxy.HostDriverVersion()
+	case "latest":
+		nvproxy.Init()
+		return nvproxy.LatestDriver().String(), nil
+	default:
+		version, err := nvproxy.DriverVersionFrom(conf.NVProxyDriverVersion)
+		return version.String(), err
+	}
 }
 
 // checkBinaryPermissions verifies that the required binary bits are set on
@@ -1744,6 +1822,17 @@ func (s *Sandbox) Mount(cid, fstype, src, dest string) error {
 		FilePayload: urpc.FilePayload{Files: files},
 	}
 	return s.call(boot.ContMgrMount, &args, nil)
+}
+
+// ContainerRuntimeState returns the runtime state of a container.
+func (s *Sandbox) ContainerRuntimeState(cid string) (boot.ContainerRuntimeState, error) {
+	log.Debugf("ContainerRuntimeState, sandbox: %q, cid: %q", s.ID, cid)
+	var state boot.ContainerRuntimeState
+	if err := s.call(boot.ContMgrContainerRuntimeState, &cid, &state); err != nil {
+		return boot.RuntimeStateInvalid, fmt.Errorf("getting container state (CID: %q): %w", cid, err)
+	}
+	log.Debugf("ContainerRuntimeState, sandbox: %q, cid: %q, state: %v", s.ID, cid, state)
+	return state, nil
 }
 
 func setCloExeOnAllFDs() error {

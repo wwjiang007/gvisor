@@ -1,4 +1,4 @@
-// Copyright 2023 The gVisor Authors.
+// Copyright 2020 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !goexperiment.exectracer2
+//go:build go1.23
 
-package sync
+#include "textflag.h"
 
-// TraceBlockReason constants, from Go's src/runtime/trace.go.
-const (
-	TraceBlockSelect TraceBlockReason = traceEvGoBlockSelect // +checkconst runtime traceBlockSelect
-	TraceBlockSync                    = traceEvGoBlockSync   // +checkconst runtime traceBlockSync
-)
+#define GOID_OFFSET 160 // +checkoffset runtime g.goid
 
-// Tracer event types, from Go's src/runtime/trace.go.
-const (
-	traceEvGoBlockSelect = 24 // +checkconst runtime traceEvGoBlockSelect
-	traceEvGoBlockSync   = 25 // +checkconst runtime traceEvGoBlockSync
-)
+// func goid() int64
+TEXT ·goid(SB),NOSPLIT|NOFRAME,$0-8
+  MOVQ (TLS), R14
+  MOVQ GOID_OFFSET(R14), R14
+  MOVQ R14, ret+0(FP)
+  RET

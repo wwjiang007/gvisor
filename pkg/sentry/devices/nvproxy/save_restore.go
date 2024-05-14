@@ -17,26 +17,41 @@ package nvproxy
 import (
 	goContext "context"
 	"fmt"
-
-	"gvisor.dev/gvisor/pkg/abi/nvgpu"
-	"gvisor.dev/gvisor/pkg/context"
 )
 
-func (n *nvproxy) beforeSave() {
-	n.objsMu.Lock()
-	defer n.objsMu.Unlock()
-	for _, o := range n.objsLive {
-		o.Release(context.Background())
-	}
-	n.objsLive = nil
+// beforeSave is invoked by stateify.
+func (nvp *nvproxy) beforeSave() {
+	nvp.beforeSaveImpl()
 }
 
-func (n *nvproxy) afterLoad(goContext.Context) {
+// afterLoad is invoked by stateify.
+func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 	Init()
-	abiCons, ok := abis[n.version]
+	abiCons, ok := abis[nvp.version]
 	if !ok {
-		panic(fmt.Sprintf("driver version %q not found in abis map", n.version))
+		panic(fmt.Sprintf("driver version %q not found in abis map", nvp.version))
 	}
-	n.abi = abiCons.cons()
-	n.objsLive = make(map[nvgpu.Handle]*object)
+	nvp.abi = abiCons.cons()
+	nvp.objsFreeSet = make(map[*object]struct{})
+	nvp.afterLoadImpl(ctx)
+}
+
+// beforeSave is invoked by stateify.
+func (fd *frontendFD) beforeSave() {
+	fd.beforeSaveImpl()
+}
+
+// afterLoad is invoked by stateify.
+func (fd *frontendFD) afterLoad(ctx goContext.Context) {
+	fd.afterLoadImpl(ctx)
+}
+
+// beforeSave is invoked by stateify.
+func (fd *uvmFD) beforeSave() {
+	fd.beforeSaveImpl()
+}
+
+// afterLoad is invoked by stateify.
+func (fd *uvmFD) afterLoad(ctx goContext.Context) {
+	fd.afterLoadImpl(ctx)
 }

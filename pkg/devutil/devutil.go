@@ -30,11 +30,12 @@ import (
 type GoferClient struct {
 	clientFD lisafs.ClientFD
 	hostFD   int
+	contName string
 }
 
 // NewGoferClient establishes the LISAFS connection to the dev gofer server.
-// It takes ownership of fd.
-func NewGoferClient(ctx context.Context, fd int) (*GoferClient, error) {
+// It takes ownership of fd. contName is the owning container name.
+func NewGoferClient(ctx context.Context, contName string, fd int) (*GoferClient, error) {
 	ctx.UninterruptibleSleepStart(false)
 	defer ctx.UninterruptibleSleepFinish(false)
 
@@ -51,6 +52,7 @@ func NewGoferClient(ctx context.Context, fd int) (*GoferClient, error) {
 	return &GoferClient{
 		clientFD: client.NewFD(devInode.ControlFD),
 		hostFD:   devHostFD,
+		contName: contName,
 	}, nil
 }
 
@@ -61,6 +63,11 @@ func (g *GoferClient) Close() {
 	if g.hostFD >= 0 {
 		_ = unix.Close(g.hostFD)
 	}
+}
+
+// ContainerName returns the name of the container that owns this gofer.
+func (g *GoferClient) ContainerName() string {
+	return g.contName
 }
 
 // DirentNames returns names of all the dirents for /dev on the gofer.
@@ -115,4 +122,9 @@ func (g *GoferClient) OpenAt(ctx context.Context, name string, flags uint32) (in
 	client.CloseFD(ctx, childFD.ID(), false /* flush */)
 	client.CloseFD(ctx, childOpenFD, true /* flush */)
 	return childHostFD, nil
+}
+
+// GoferClientProvider provides a GoferClient for a given container.
+type GoferClientProvider interface {
+	GetDevGoferClient(contName string) *GoferClient
 }

@@ -51,11 +51,13 @@ package systrap
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -185,10 +187,7 @@ restart:
 		return nil, hostarch.NoAccess, err
 	}
 	if needPatch {
-		restart, _ := s.usertrap.PatchSyscall(ctx, ac, mm)
-		if restart {
-			goto restart
-		}
+		s.usertrap.PatchSyscall(ctx, ac, mm)
 	}
 	if !isSyscall && linux.Signal(c.signalInfo.Signo) == linux.SIGILL {
 		err := s.usertrap.HandleFault(ctx, ac, mm)
@@ -319,6 +318,10 @@ func (*Systrap) MinUserAddress() hostarch.Addr {
 func New() (*Systrap, error) {
 	// CPUID information has been initialized at this point.
 	archState.Init()
+	// GOMAXPROCS has been set at this point.
+	maxSysmsgThreads = runtime.GOMAXPROCS(0)
+	// Account for syscall thread.
+	maxChildThreads = maxSysmsgThreads + 1
 
 	mf, err := createMemoryFile()
 	if err != nil {
@@ -326,6 +329,9 @@ func New() (*Systrap, error) {
 	}
 
 	stubInitialized.Do(func() {
+		// Don't use sentry and stub fast paths if here is just one cpu.
+		neverEnableFastPath = min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) == 1
+
 		// Initialize the stub.
 		stubInit()
 
@@ -390,11 +396,11 @@ func (*Systrap) NewContext(ctx pkgcontext.Context) platform.Context {
 
 type constructor struct{}
 
-func (*constructor) New(_ *os.File) (platform.Platform, error) {
+func (*constructor) New(_ *fd.FD) (platform.Platform, error) {
 	return New()
 }
 
-func (*constructor) OpenDevice(_ string) (*os.File, error) {
+func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
 	return nil, nil
 }
 

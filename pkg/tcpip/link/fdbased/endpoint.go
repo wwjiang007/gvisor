@@ -42,6 +42,7 @@ package fdbased
 
 import (
 	"fmt"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -221,16 +222,15 @@ type Options struct {
 	// system call.
 	MaxSyscallHeaderBytes int
 
-	// AFXDPFD is used with the experimental AF_XDP mode.
-	// TODO(b/240191988): Use multiple sockets.
-	// TODO(b/240191988): How do we handle the MTU issue?
-	AFXDPFD *int
-
 	// InterfaceIndex is the interface index of the underlying device.
 	InterfaceIndex int
 
 	// GRO enables generic receive offload.
 	GRO bool
+
+	// ProcessorsPerChannel is the number of goroutines used to handle packets
+	// from each FD.
+	ProcessorsPerChannel int
 }
 
 // fanoutID is used for AF_PACKET based endpoints to enable PACKET_FANOUT
@@ -323,6 +323,9 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 				e.gsoMaxSize = opts.GSOMaxSize
 			}
 		}
+		if opts.ProcessorsPerChannel == 0 {
+			opts.ProcessorsPerChannel = max(1, runtime.GOMAXPROCS(0)/len(opts.FDs))
+		}
 
 		inboundDispatcher, err := createInboundDispatcher(e, fd, isSocket, fid, opts)
 		if err != nil {
@@ -337,7 +340,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 func createInboundDispatcher(e *endpoint, fd int, isSocket bool, fID int32, opts *Options) (linkDispatcher, error) {
 	// By default use the readv() dispatcher as it works with all kinds of
 	// FDs (tap/tun/unix domain sockets and af_packet).
-	inboundDispatcher, err := newReadVDispatcher(fd, e)
+	inboundDispatcher, err := newReadVDispatcher(fd, e, opts)
 	if err != nil {
 		return nil, fmt.Errorf("newReadVDispatcher(%d, %+v) = %v", fd, e, err)
 	}
@@ -377,7 +380,7 @@ func createInboundDispatcher(e *endpoint, fd int, isSocket bool, fID int32, opts
 
 		switch e.packetDispatchMode {
 		case PacketMMap:
-			inboundDispatcher, err = newPacketMMapDispatcher(fd, e)
+			inboundDispatcher, err = newPacketMMapDispatcher(fd, e, opts)
 			if err != nil {
 				return nil, fmt.Errorf("newPacketMMapDispatcher(%d, %+v) = %v", fd, e, err)
 			}
