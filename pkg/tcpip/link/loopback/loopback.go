@@ -28,8 +28,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+// +stateify savable
 type endpoint struct {
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
@@ -61,6 +62,9 @@ func (*endpoint) MTU() uint32 {
 	return 65536
 }
 
+// SetMTU implements stack.LinkEndpoint.SetMTU. It has no impact.
+func (*endpoint) SetMTU(uint32) {}
+
 // Capabilities implements stack.LinkEndpoint.Capabilities. Loopback advertises
 // itself as supporting checksum offload, but in reality it's just omitted.
 func (*endpoint) Capabilities() stack.LinkEndpointCapabilities {
@@ -77,6 +81,9 @@ func (*endpoint) MaxHeaderLength() uint16 {
 func (*endpoint) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
+
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (*endpoint) SetLinkAddress(tcpip.LinkAddress) {}
 
 // Wait implements stack.LinkEndpoint.Wait.
 func (*endpoint) Wait() {}
@@ -112,3 +119,6 @@ func (*endpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements stack.LinkEndpoint.
 func (*endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// Close implements stack.LinkEndpoint.
+func (*endpoint) Close() {}

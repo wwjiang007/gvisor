@@ -32,10 +32,12 @@ var _ stack.NetworkDispatcher = (*Endpoint)(nil)
 var _ stack.LinkEndpoint = (*Endpoint)(nil)
 
 // Endpoint is a waitable link-layer endpoint.
+//
+// +stateify savable
 type Endpoint struct {
 	dispatchGate sync.Gate
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 
@@ -106,6 +108,12 @@ func (e *Endpoint) MTU() uint32 {
 	return e.lower.MTU()
 }
 
+// SetMTU implements stack.LinkEndpoint.SetMTU. It just forwards the request to
+// the lower endpoint.
+func (e *Endpoint) SetMTU(mtu uint32) {
+	e.lower.SetMTU(mtu)
+}
+
 // Capabilities implements stack.LinkEndpoint.Capabilities. It just forwards the
 // request to the lower endpoint.
 func (e *Endpoint) Capabilities() stack.LinkEndpointCapabilities {
@@ -122,6 +130,14 @@ func (e *Endpoint) MaxHeaderLength() uint16 {
 // request to the lower endpoint.
 func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 	return e.lower.LinkAddress()
+}
+
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress. It forwards the
+// request to the lower endpoint.
+func (e *Endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lower.SetLinkAddress(addr)
 }
 
 // WritePackets implements stack.LinkEndpoint.WritePackets. It is called by
@@ -165,4 +181,9 @@ func (e *Endpoint) AddHeader(pkt *stack.PacketBuffer) {
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
 func (e *Endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
 	return e.lower.ParseHeader(pkt)
+}
+
+// Close implements stack.LinkEndpoint.
+func (e *Endpoint) Close() {
+	e.lower.Close()
 }

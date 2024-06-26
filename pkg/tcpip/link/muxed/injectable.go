@@ -28,10 +28,12 @@ import (
 // trivial routing rules that determine which InjectableEndpoint a given packet
 // will be written to. Note that HandleLocal works differently for this
 // endpoint (see WritePacket).
+//
+// +stateify savable
 type InjectableEndpoint struct {
 	routes map[tcpip.Address]stack.InjectableLinkEndpoint
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
@@ -45,6 +47,13 @@ func (m *InjectableEndpoint) MTU() uint32 {
 		}
 	}
 	return minMTU
+}
+
+// SetMTU implements stack.LinkEndpoint.
+func (m *InjectableEndpoint) SetMTU(mtu uint32) {
+	for _, endpoint := range m.routes {
+		endpoint.SetMTU(mtu)
+	}
 }
 
 // Capabilities implements stack.LinkEndpoint.
@@ -71,6 +80,9 @@ func (m *InjectableEndpoint) MaxHeaderLength() uint16 {
 func (m *InjectableEndpoint) LinkAddress() tcpip.LinkAddress {
 	return ""
 }
+
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (m *InjectableEndpoint) SetLinkAddress(tcpip.LinkAddress) {}
 
 // Attach implements stack.LinkEndpoint.
 func (m *InjectableEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
@@ -149,6 +161,9 @@ func (*InjectableEndpoint) AddHeader(*stack.PacketBuffer) {}
 
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
 func (*InjectableEndpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// Close implements stack.LinkEndpoint.
+func (*InjectableEndpoint) Close() {}
 
 // NewInjectableEndpoint creates a new multi-endpoint injectable endpoint.
 func NewInjectableEndpoint(routes map[tcpip.Address]stack.InjectableLinkEndpoint) *InjectableEndpoint {

@@ -149,10 +149,9 @@ func addDriverABI(major, minor, patch int, runfileChecksum string, cons driverAB
 // Init initializes abis global map.
 func Init() {
 	abisOnce.Do(func() {
-		v535_104_05 := addDriverABI(535, 104, 05, "2f9d609d1da770beee757636635c46e7ed8253ade887b87c7a5482e33fcbedc9", func() *driverABI {
-			// 535.104.05 is the earliest driver version supported by nvproxy. Since
-			// there is no parent to inherit from, the driverABI needs to be constructed
-			// with the entirety of the nvproxy functionality at this version.
+		v535_104_05 := func() *driverABI {
+			// Since there is no parent to inherit from, the driverABI needs to be
+			// constructed with the entirety of the nvproxy functionality.
 			return &driverABI{
 				frontendIoctl: map[uint32]frontendIoctlHandler{
 					nvgpu.NV_ESC_CARD_INFO:                     frontendIoctlSimple, // nv_ioctl_card_info_t array
@@ -164,8 +163,8 @@ func Init() {
 					nvgpu.NV_ESC_RM_UNMAP_MEMORY:               frontendIoctlSimple, // NVOS34_PARAMETERS
 					nvgpu.NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO: frontendIoctlSimple, // NVOS56_PARAMETERS
 					nvgpu.NV_ESC_REGISTER_FD:                   frontendRegisterFD,
-					nvgpu.NV_ESC_ALLOC_OS_EVENT:                rmAllocOSEvent,
-					nvgpu.NV_ESC_FREE_OS_EVENT:                 rmFreeOSEvent,
+					nvgpu.NV_ESC_ALLOC_OS_EVENT:                frontendIoctHasFD[nvgpu.IoctlAllocOSEvent],
+					nvgpu.NV_ESC_FREE_OS_EVENT:                 frontendIoctHasFD[nvgpu.IoctlFreeOSEvent],
 					nvgpu.NV_ESC_NUMA_INFO:                     rmNumaInfo,
 					nvgpu.NV_ESC_RM_ALLOC_MEMORY:               rmAllocMemory,
 					nvgpu.NV_ESC_RM_FREE:                       rmFree,
@@ -179,17 +178,19 @@ func Init() {
 					nvgpu.UVM_DEINITIALIZE:                   uvmIoctlNoParams,
 					nvgpu.UVM_CREATE_RANGE_GROUP:             uvmIoctlSimple[nvgpu.UVM_CREATE_RANGE_GROUP_PARAMS],
 					nvgpu.UVM_DESTROY_RANGE_GROUP:            uvmIoctlSimple[nvgpu.UVM_DESTROY_RANGE_GROUP_PARAMS],
-					nvgpu.UVM_REGISTER_GPU_VASPACE:           uvmIoctlHasRMCtrlFD[nvgpu.UVM_REGISTER_GPU_VASPACE_PARAMS],
+					nvgpu.UVM_REGISTER_GPU_VASPACE:           uvmIoctlHasFrontendFD[nvgpu.UVM_REGISTER_GPU_VASPACE_PARAMS],
 					nvgpu.UVM_UNREGISTER_GPU_VASPACE:         uvmIoctlSimple[nvgpu.UVM_UNREGISTER_GPU_VASPACE_PARAMS],
-					nvgpu.UVM_REGISTER_CHANNEL:               uvmIoctlHasRMCtrlFD[nvgpu.UVM_REGISTER_CHANNEL_PARAMS],
+					nvgpu.UVM_REGISTER_CHANNEL:               uvmIoctlHasFrontendFD[nvgpu.UVM_REGISTER_CHANNEL_PARAMS],
 					nvgpu.UVM_UNREGISTER_CHANNEL:             uvmIoctlSimple[nvgpu.UVM_UNREGISTER_CHANNEL_PARAMS],
-					nvgpu.UVM_MAP_EXTERNAL_ALLOCATION:        uvmIoctlHasRMCtrlFD[nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS],
+					nvgpu.UVM_SET_RANGE_GROUP:                uvmIoctlSimple[nvgpu.UVM_SET_RANGE_GROUP_PARAMS],
+					nvgpu.UVM_MAP_EXTERNAL_ALLOCATION:        uvmIoctlHasFrontendFD[nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS],
 					nvgpu.UVM_FREE:                           uvmIoctlSimple[nvgpu.UVM_FREE_PARAMS],
-					nvgpu.UVM_REGISTER_GPU:                   uvmIoctlHasRMCtrlFD[nvgpu.UVM_REGISTER_GPU_PARAMS],
+					nvgpu.UVM_REGISTER_GPU:                   uvmIoctlHasFrontendFD[nvgpu.UVM_REGISTER_GPU_PARAMS],
 					nvgpu.UVM_UNREGISTER_GPU:                 uvmIoctlSimple[nvgpu.UVM_UNREGISTER_GPU_PARAMS],
 					nvgpu.UVM_PAGEABLE_MEM_ACCESS:            uvmIoctlSimple[nvgpu.UVM_PAGEABLE_MEM_ACCESS_PARAMS],
 					nvgpu.UVM_SET_PREFERRED_LOCATION:         uvmIoctlSimple[nvgpu.UVM_SET_PREFERRED_LOCATION_PARAMS],
 					nvgpu.UVM_DISABLE_READ_DUPLICATION:       uvmIoctlSimple[nvgpu.UVM_DISABLE_READ_DUPLICATION_PARAMS],
+					nvgpu.UVM_MIGRATE_RANGE_GROUP:            uvmIoctlSimple[nvgpu.UVM_MIGRATE_RANGE_GROUP_PARAMS],
 					nvgpu.UVM_MAP_DYNAMIC_PARALLELISM_REGION: uvmIoctlSimple[nvgpu.UVM_MAP_DYNAMIC_PARALLELISM_REGION_PARAMS],
 					nvgpu.UVM_ALLOC_SEMAPHORE_POOL:           uvmIoctlSimple[nvgpu.UVM_ALLOC_SEMAPHORE_POOL_PARAMS],
 					nvgpu.UVM_VALIDATE_VA_RANGE:              uvmIoctlSimple[nvgpu.UVM_VALIDATE_VA_RANGE_PARAMS],
@@ -279,7 +280,10 @@ func Init() {
 					nvgpu.NVA06F_CTRL_CMD_GPFIFO_SCHEDULE:                                  rmControlSimple,
 					nvgpu.NVC56F_CTRL_CMD_GET_KMB:                                          rmControlSimple,
 					nvgpu.NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION:                         ctrlClientSystemGetBuildVersion,
-					nvgpu.NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD:                      ctrlExportObjectToFD,
+					nvgpu.NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD:                      ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS],
+					nvgpu.NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD:                    ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS],
+					nvgpu.NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO:                   ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS],
+					nvgpu.NV0041_CTRL_CMD_GET_SURFACE_INFO:                                 ctrlClientGetSurfaceInfo,
 					nvgpu.NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST:                             ctrlDevFIFOGetChannelList,
 					nvgpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST:                                ctrlDevGpuGetClasslist,
 					nvgpu.NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS:                            ctrlSubdevFIFODisableChannels,
@@ -323,7 +327,7 @@ func Init() {
 					nvgpu.HOPPER_SEC2_WORK_LAUNCH_A: rmAllocNoParams,
 				},
 			}
-		})
+		}
 
 		// 535.104.12 exists on the "535.104.12" branch. It branched off the main
 		// branch at 535.104.05.
@@ -341,6 +345,7 @@ func Init() {
 		// 545.23.06 is an intermediate unqualified version from the main branch.
 		v545_23_06 := func() *driverABI {
 			abi := v535_113_01()
+			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO] = ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545]
 			abi.allocationClass[nvgpu.NV01_MEMORY_SYSTEM] = rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545]
 			abi.allocationClass[nvgpu.NV01_MEMORY_LOCAL_USER] = rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545]
 			abi.allocationClass[nvgpu.NV50_MEMORY_VIRTUAL] = rmAllocSimple[nvgpu.NV_MEMORY_ALLOCATION_PARAMS_V545]
@@ -364,7 +369,7 @@ func Init() {
 		v550_54_14 := addDriverABI(550, 54, 14, "8c497ff1cfc7c310fb875149bc30faa4fd26d2237b2cba6cd2e8b0780157cfe3", func() *driverABI {
 			abi := v550_40_07()
 			abi.uvmIoctl[nvgpu.UVM_ALLOC_SEMAPHORE_POOL] = uvmIoctlSimple[nvgpu.UVM_ALLOC_SEMAPHORE_POOL_PARAMS_V550]
-			abi.uvmIoctl[nvgpu.UVM_MAP_EXTERNAL_ALLOCATION] = uvmIoctlHasRMCtrlFD[nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550]
+			abi.uvmIoctl[nvgpu.UVM_MAP_EXTERNAL_ALLOCATION] = uvmIoctlHasFrontendFD[nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550]
 			return abi
 		})
 		_ = addDriverABI(550, 54, 15, "2e859ae5f912a9a47aaa9b2d40a94a14f6f486b5d3b67c0ddf8b72c1c9650385", v550_54_14)

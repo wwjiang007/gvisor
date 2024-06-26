@@ -234,6 +234,8 @@ type Loader struct {
 	//
 	// portForwardProxies is guarded by mu.
 	portForwardProxies []*pf.Proxy
+
+	saveFDs []*fd.FD
 }
 
 // execID uniquely identifies a sentry process that is executed in a container.
@@ -338,6 +340,8 @@ type Args struct {
 	// NvidiaDriverVersion is the NVIDIA driver ABI version to use for
 	// communicating with NVIDIA devices on the host.
 	NvidiaDriverVersion string
+
+	SaveFDs []*fd.FD
 }
 
 // make sure stdioFDs are always the same on initial start and on restore
@@ -406,6 +410,7 @@ func New(args Args) (*Loader, error) {
 		stopProfiling: stopProfiling,
 		productName:   args.ProductName,
 		containerIDs:  map[string]string{},
+		saveFDs:       args.SaveFDs,
 	}
 
 	containerName := l.registerContainerLocked(args.Spec, args.ID)
@@ -606,6 +611,14 @@ func New(args Args) (*Loader, error) {
 	// tremendous number of useless ones (I'm looking at you, ptrace).
 	if err := sighandling.IgnoreChildStop(); err != nil {
 		return nil, fmt.Errorf("ignore child stop signals failed: %w", err)
+	}
+
+	if len(args.Conf.TestOnlyAutosaveImagePath) != 0 {
+		enableAutosave(l, args.Conf.TestOnlyAutosaveResume, l.saveFDs)
+	}
+
+	if err := l.initDone(args); err != nil {
+		return nil, err
 	}
 
 	// Create the control server using the provided FD.
@@ -1230,6 +1243,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	if args.MountNamespace == nil || !args.MountNamespace.TryIncRef() {
 		return 0, fmt.Errorf("container %q has stopped", args.ContainerID)
 	}
+	sctx := l.k.SupervisorContext()
+	root := args.MountNamespace.Root(sctx)
+	defer root.DecRef(sctx)
+	ctx := vfs.WithRoot(sctx, root)
+	defer args.MountNamespace.DecRef(ctx)
 
 	args.Envv, err = specutils.ResolveEnvs(args.Envv)
 	if err != nil {
@@ -1237,11 +1255,6 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	}
 
 	// Add the HOME environment variable if it is not already set.
-	sctx := l.k.SupervisorContext()
-	root := args.MountNamespace.Root(sctx)
-	defer root.DecRef(sctx)
-	ctx := vfs.WithRoot(sctx, root)
-	defer args.MountNamespace.DecRef(ctx)
 	args.Envv, err = user.MaybeAddExecUserHome(ctx, args.MountNamespace, args.KUID, args.Envv)
 	if err != nil {
 		return 0, err

@@ -27,6 +27,9 @@ import (
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
+	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
+	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -104,18 +107,18 @@ func (s *Stack) RemoveInterface(idx int32) error {
 // SetInterface implements inet.Stack.SetInterface.
 func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
 	var ifinfomsg linux.InterfaceInfoMessage
-	attrs, ok := msg.GetData(&ifinfomsg)
+	attrsView, ok := msg.GetData(&ifinfomsg)
 	if !ok {
 		return syserr.ErrInvalidArgument
 	}
-	for !attrs.Empty() {
-		// The index is unspecified, search by the interface name.
-		ahdr, value, rest, ok := attrs.ParseFirst()
-		if !ok {
-			return syserr.ErrInvalidArgument
-		}
-		attrs = rest
-		switch ahdr.Type {
+	attrs, ok := attrsView.Parse()
+	if !ok {
+		return syserr.ErrInvalidArgument
+	}
+	ifname := ""
+	for attr := range attrs {
+		value := attrs[attr]
+		switch attr {
 		case linux.IFLA_IFNAME:
 			if len(value) < 1 {
 				return syserr.ErrInvalidArgument
@@ -124,23 +127,29 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 				// Device name changing isn't supported yet.
 				return syserr.ErrNotSupported
 			}
-			ifname := string(value[:len(value)-1])
+			ifname = value.String()
 			for idx, ifa := range s.Interfaces() {
 				if ifname == ifa.Name {
 					ifinfomsg.Index = idx
 					break
 				}
 			}
+		case linux.IFLA_MASTER:
+		case linux.IFLA_LINKINFO:
+		case linux.IFLA_ADDRESS:
 		default:
-			ctx.Warningf("unexpected attribute: %x", ahdr.Type)
+			ctx.Warningf("unexpected attribute: %x", attr)
 			return syserr.ErrNotSupported
 		}
 	}
+	flags := msg.Header().Flags
 	if ifinfomsg.Index == 0 {
+		if flags&linux.NLM_F_CREATE != 0 {
+			return s.newInterface(ctx, msg, attrs)
+		}
 		return syserr.ErrNoDevice
 	}
 
-	flags := msg.Header().Flags
 	if flags&(linux.NLM_F_EXCL|linux.NLM_F_REPLACE) != 0 {
 		return syserr.ErrExists
 	}
@@ -156,7 +165,181 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		}
 		// Netstack interfaces are always up.
 	}
+
+	return s.setLink(tcpip.NICID(ifinfomsg.Index), attrs)
+}
+
+func (s *Stack) setLink(id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
+	for t, v := range linkAttrs {
+		switch t {
+		case linux.IFLA_MASTER:
+			master, ok := v.Uint32()
+			if !ok {
+				return syserr.ErrInvalidArgument
+			}
+			if master != 0 {
+				if err := s.Stack.SetNICCoordinator(id, tcpip.NICID(master)); err != nil {
+					return syserr.TranslateNetstackError(err)
+				}
+			}
+		case linux.IFLA_ADDRESS:
+			addr, err := tcpip.ParseMACAddress(v.String())
+			if err != nil {
+				return syserr.ErrInvalidArgument
+			}
+			if err := s.Stack.SetNICAddress(id, addr); err != nil {
+				return syserr.TranslateNetstackError(err)
+			}
+		}
+	}
 	return nil
+}
+
+const defaultMTU = 1500
+
+func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesView, linkInfoAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
+	var (
+		linkInfoData  map[uint16]nlmsg.BytesView
+		ifinfomsg     linux.InterfaceInfoMessage
+		peerLinkAttrs map[uint16]nlmsg.BytesView
+	)
+
+	peerStack := s
+	peerName := ""
+	ifname := ""
+
+	if v, ok := linkAttrs[linux.IFLA_IFNAME]; ok {
+		ifname = v.String()
+	}
+	if value, ok := linkInfoAttrs[linux.IFLA_INFO_DATA]; ok {
+		linkInfoData, ok = nlmsg.AttrsView(value).Parse()
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		if v, ok := linkInfoData[linux.VETH_INFO_PEER]; ok {
+			attrsView := nlmsg.AttrsView(v[ifinfomsg.SizeBytes():])
+			if !ok {
+				return syserr.ErrInvalidArgument
+			}
+			peerLinkAttrs, ok = attrsView.Parse()
+			if !ok {
+				return syserr.ErrInvalidArgument
+			}
+			if v, ok = peerLinkAttrs[linux.IFLA_IFNAME]; ok {
+				peerName = v.String()
+			}
+			if v, ok = peerLinkAttrs[linux.IFLA_NET_NS_FD]; ok {
+				fd, ok := v.Uint32()
+				if !ok {
+					return syserr.ErrInvalidArgument
+				}
+				f := inet.NamespaceByFDFromContext(ctx)
+				if f == nil {
+					return syserr.ErrInvalidArgument
+				}
+				ns, err := f(int32(fd))
+				if err != nil {
+					return syserr.FromError(err)
+				}
+				defer ns.DecRef(ctx)
+				peerStack = ns.Stack().(*Stack)
+			}
+		}
+	}
+	ep, peerEP := veth.NewPair(defaultMTU)
+	id := tcpip.NICID(s.Stack.UniqueID())
+	peerID := tcpip.NICID(peerStack.Stack.UniqueID())
+	if ifname == "" {
+		ifname = fmt.Sprintf("veth%d", id)
+	}
+	err := s.Stack.CreateNICWithOptions(id, packetsocket.New(ethernet.New(ep)), stack.NICOptions{
+		Name: ifname,
+	})
+	if err != nil {
+		return syserr.TranslateNetstackError(err)
+	}
+	ep.SetStack(s.Stack, id)
+	if err := s.setLink(id, linkAttrs); err != nil {
+		peerEP.Close()
+		return err
+	}
+
+	if peerName == "" {
+		peerName = fmt.Sprintf("veth%d", peerID)
+	}
+	err = peerStack.Stack.CreateNICWithOptions(peerID, packetsocket.New(ethernet.New(peerEP)), stack.NICOptions{
+		Name: peerName,
+	})
+	if err != nil {
+		peerEP.Close()
+		return syserr.TranslateNetstackError(err)
+	}
+	peerEP.SetStack(peerStack.Stack, peerID)
+	if peerLinkAttrs != nil {
+		if err := s.setLink(peerID, peerLinkAttrs); err != nil {
+			peerStack.Stack.RemoveNIC(peerID)
+			peerEP.Close()
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesView, linkInfoAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
+	ifname := ""
+
+	if v, ok := linkAttrs[linux.IFLA_IFNAME]; ok {
+		ifname = v.String()
+	}
+	ep := stack.NewBridgeEndpoint(defaultMTU)
+	id := tcpip.NICID(s.Stack.UniqueID())
+	err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{
+		Name: ifname,
+	})
+	if err != nil {
+		return syserr.TranslateNetstackError(err)
+	}
+	if err := s.setLink(id, linkAttrs); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Stack) newInterface(ctx context.Context, msg *nlmsg.Message, linkAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
+	var (
+		linkInfoAttrs map[uint16]nlmsg.BytesView
+		kind          string
+	)
+
+	if v, ok := linkAttrs[linux.IFLA_LINKINFO]; ok {
+		linkInfoAttrs, ok = nlmsg.AttrsView(v).Parse()
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+
+		for attr := range linkInfoAttrs {
+			value := linkInfoAttrs[attr]
+			switch attr {
+			case linux.IFLA_INFO_KIND:
+				kind = value.String()
+			case linux.IFLA_INFO_DATA:
+			default:
+				ctx.Warningf("unexpected link info attribute: %x", attr)
+				return syserr.ErrNotSupported
+			}
+		}
+	}
+	switch kind {
+	case "":
+		return syserr.ErrInvalidArgument
+	case "bridge":
+		return s.newBridge(ctx, linkAttrs, linkInfoAttrs)
+	case "veth":
+		return s.newVeth(ctx, linkAttrs, linkInfoAttrs)
+	}
+	return syserr.ErrNotSupported
 }
 
 // InterfaceAddrs implements inet.Stack.InterfaceAddrs.

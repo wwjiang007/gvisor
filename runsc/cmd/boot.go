@@ -138,6 +138,8 @@ type Boot struct {
 
 	sinkFDs intFlags
 
+	saveFDs intFlags
+
 	// pidns is set if the sandbox is in its own pid namespace.
 	pidns bool
 
@@ -219,6 +221,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is an optional file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&b.podInitConfigFD, "pod-init-config-fd", -1, "file descriptor to the pod init configuration file.")
 	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
+	f.Var(&b.saveFDs, "save-fds", "ordered list of file descriptors to be used save checkpoints. Order: kernel state, page metadata, page file")
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
@@ -453,6 +456,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		SinkFDs:             b.sinkFDs.GetArray(),
 		ProfileOpts:         b.profileFDs.ToOpts(),
 		NvidiaDriverVersion: b.nvidiaDriverVersion,
+		SaveFDs:             b.saveFDs.GetFDs(),
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {
@@ -469,17 +473,6 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			// Umount /proc right before installing seccomp filters.
 			umountProc(b.procMountSyncFD)
 		}
-	}
-
-	if conf.TestOnlyAutosaveImagePath != "" {
-		fName := filepath.Join(conf.TestOnlyAutosaveImagePath, boot.CheckpointStateFileName)
-		f, err := os.OpenFile(fName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-		if err != nil {
-			util.Fatalf("error in creating state file %v", err)
-		}
-		defer f.Close()
-
-		boot.EnableAutosave(l, f, conf.TestOnlyAutosaveResume)
 	}
 
 	// Prepare metrics.

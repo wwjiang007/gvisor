@@ -62,6 +62,12 @@ func (p *processor) deliverPackets() {
 	p.e.mu.RLock()
 	p.gro.Dispatcher = p.e.dispatcher
 	p.e.mu.RUnlock()
+	if p.gro.Dispatcher == nil {
+		p.mu.Lock()
+		p.pkts.Reset()
+		p.mu.Unlock()
+		return
+	}
 
 	p.mu.Lock()
 	for p.pkts.Len() > 0 {
@@ -131,7 +137,7 @@ func (m *processorManager) connectionHash(cid *connectionID) uint32 {
 
 // queuePacket queues a packet to be delivered to the appropriate processor.
 func (m *processorManager) queuePacket(pkt *stack.PacketBuffer, hasEthHeader bool) {
-	var pIdx int
+	var pIdx uint32
 	cid, nonConnectionPkt := tcpipConnectionID(pkt)
 	if !hasEthHeader {
 		if nonConnectionPkt {
@@ -146,7 +152,7 @@ func (m *processorManager) queuePacket(pkt *stack.PacketBuffer, hasEthHeader boo
 		// first processor.
 		pIdx = 0
 	} else {
-		pIdx = int(m.connectionHash(&cid)) % len(m.processors)
+		pIdx = m.connectionHash(&cid) % uint32(len(m.processors))
 	}
 	p := &m.processors[pIdx]
 	p.mu.Lock()
@@ -187,8 +193,12 @@ func tcpipConnectionID(pkt *stack.PacketBuffer) (connectionID, bool) {
 
 		cid.srcAddr = ipHdr.SourceAddressSlice()
 		cid.dstAddr = ipHdr.DestinationAddressSlice()
-		cid.srcPort = tcpHdr.SourcePort()
-		cid.dstPort = tcpHdr.DestinationPort()
+		// All fragment packets need to be processed by the same goroutine, so
+		// only record the TCP ports if this is not a fragment packet.
+		if ipHdr.IsValid(pkt.Data().Size()) && !ipHdr.More() && ipHdr.FragmentOffset() == 0 {
+			cid.srcPort = tcpHdr.SourcePort()
+			cid.dstPort = tcpHdr.DestinationPort()
+		}
 		cid.proto = header.IPv4ProtocolNumber
 	case header.IPv6Version:
 		h, ok = pkt.Data().PullUp(header.IPv6FixedHeaderSize + tcpSrcDstPortLen)

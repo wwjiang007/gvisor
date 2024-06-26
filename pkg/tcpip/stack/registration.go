@@ -319,6 +319,9 @@ type NetworkHeaderParams struct {
 
 	// TOS refers to TypeOfService or TrafficClass field of the IP-header.
 	TOS uint8
+
+	// DF indicates whether the DF bit should be set.
+	DF bool
 }
 
 // GroupAddressableEndpoint is an endpoint that supports group addressing.
@@ -384,6 +387,8 @@ const (
 
 // AddressLifetimes encodes an address' preferred and valid lifetimes, as well
 // as if the address is deprecated.
+//
+// +stateify savable
 type AddressLifetimes struct {
 	// Deprecated is whether the address is deprecated.
 	Deprecated bool
@@ -917,6 +922,8 @@ type NetworkProtocol interface {
 
 // UnicastSourceAndMulticastDestination is a tuple that represents a unicast
 // source address and a multicast destination address.
+//
+// +stateify savable
 type UnicastSourceAndMulticastDestination struct {
 	// Source represents a unicast source address.
 	Source tcpip.Address
@@ -1083,6 +1090,9 @@ type NetworkLinkEndpoint interface {
 	// includes the maximum size of an IP packet.
 	MTU() uint32
 
+	// SetMTU update the maximum transmission unit for the endpoint.
+	SetMTU(mtu uint32)
+
 	// MaxHeaderLength returns the maximum size the data link (and
 	// lower level layers combined) headers can have. Higher levels use this
 	// information to reserve space in the front of the packets they're
@@ -1092,6 +1102,9 @@ type NetworkLinkEndpoint interface {
 	// LinkAddress returns the link address (typically a MAC) of the
 	// endpoint.
 	LinkAddress() tcpip.LinkAddress
+
+	// SetLinkAddress updated the endpoint's link address (typically a MAC).
+	SetLinkAddress(addr tcpip.LinkAddress)
 
 	// Capabilities returns the set of capabilities supported by the
 	// endpoint.
@@ -1128,6 +1141,9 @@ type NetworkLinkEndpoint interface {
 
 	// ParseHeader parses the link layer header to the packet.
 	ParseHeader(*PacketBuffer) bool
+
+	// Close is called when the endpoint is removed from a stack.
+	Close()
 }
 
 // QueueingDiscipline provides a queueing strategy for outgoing packets (e.g
@@ -1241,6 +1257,8 @@ const (
 )
 
 // DADConfigurations holds configurations for duplicate address detection.
+//
+// +stateify savable
 type DADConfigurations struct {
 	// The number of Neighbor Solicitation messages to send when doing
 	// Duplicate Address Detection for a tentative address.

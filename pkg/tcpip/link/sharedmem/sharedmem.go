@@ -41,6 +41,8 @@ import (
 // QueueConfig holds all the file descriptors needed to describe a tx or rx
 // queue over shared memory. It is used when creating new shared memory
 // endpoints to describe tx and rx queues.
+//
+// +stateify savable
 type QueueConfig struct {
 	// DataFD is a file descriptor for the file that contains the data to
 	// be transmitted via this queue. Descriptors contain offsets within
@@ -92,6 +94,8 @@ func QueueConfigFromFDs(fds []int) (QueueConfig, error) {
 }
 
 // Options specify the details about the sharedmem endpoint to be created.
+//
+// +stateify savable
 type Options struct {
 	// MTU is the mtu to use for this endpoint.
 	MTU uint32
@@ -142,18 +146,11 @@ type Options struct {
 var _ stack.LinkEndpoint = (*endpoint)(nil)
 var _ stack.GSOEndpoint = (*endpoint)(nil)
 
+// +stateify savable
 type endpoint struct {
-	// mtu (maximum transmission unit) is the maximum size of a packet.
-	// mtu is immutable.
-	mtu uint32
-
 	// bufferSize is the size of each individual buffer.
 	// bufferSize is immutable.
 	bufferSize uint32
-
-	// addr is the local address of this endpoint.
-	// addr is immutable.
-	addr tcpip.LinkAddress
 
 	// peerFD is an fd to the peer that can be used to detect when the
 	// peer is gone.
@@ -187,10 +184,11 @@ type endpoint struct {
 
 	// onClosed is a function to be called when the FD's peer (if any) closes
 	// its end of the communication pipe.
-	onClosed func(tcpip.Error)
+	// TODO(b/341946753): Restore when netstack is savable.
+	onClosed func(tcpip.Error) `state:"nosave"`
 
 	// mu protects the following fields.
-	mu sync.Mutex
+	mu sync.RWMutex `state:"nosave"`
 
 	// tx is the transmit queue.
 	// +checklocks:mu
@@ -199,6 +197,14 @@ type endpoint struct {
 	// workerStarted specifies whether the worker goroutine was started.
 	// +checklocks:mu
 	workerStarted bool
+
+	// addr is the local address of this endpoint.
+	//
+	// +checklocks:mu
+	addr tcpip.LinkAddress
+	// mtu (maximum transmission unit) is the maximum size of a packet.
+	// +checklocks:mu
+	mtu uint32
 }
 
 // New creates a new shared-memory-based endpoint. Buffers will be broken up
@@ -316,10 +322,17 @@ func (e *endpoint) IsAttached() bool {
 	return e.workerStarted
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
-// during construction.
+// MTU implements stack.LinkEndpoint.MTU.
 func (e *endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+func (e *endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
@@ -336,11 +349,22 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 // LinkAddress implements stack.LinkEndpoint.LinkAddress. It returns the local
 // link address.
 func (e *endpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.addr
+}
+
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.addr = addr
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
 func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	// Add ethernet header if needed.
 	if len(e.addr) == 0 {
 		return
@@ -361,6 +385,8 @@ func (e *endpoint) parseHeader(pkt *stack.PacketBuffer) bool {
 
 // ParseHeader implements stack.LinkEndpoint.ParseHeader.
 func (e *endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	// Add ethernet header if needed.
 	if len(e.addr) == 0 {
 		return true
@@ -462,7 +488,10 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 		}
 
 		var proto tcpip.NetworkProtocolNumber
-		if len(e.addr) != 0 {
+		e.mu.RLock()
+		addrLen := len(e.addr)
+		e.mu.RUnlock()
+		if addrLen != 0 {
 			if !e.parseHeader(pkt) {
 				pkt.DecRef()
 				continue
@@ -487,7 +516,6 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 				continue
 			}
 		}
-
 		// Send packet up the stack.
 		d.DeliverNetworkPacket(proto, pkt)
 		pkt.DecRef()

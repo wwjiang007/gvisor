@@ -342,10 +342,16 @@ func (s *sender) updateMaxPayloadSize(mtu, count int) {
 			break
 		}
 
-		if nextSeg == s.writeNext && seg.payloadSize() > m {
-			// We found a segment exceeding the MTU. Rewind
-			// writeNext and try to retransmit it.
-			nextSeg = seg
+		if seg.payloadSize() > m {
+			// xmitCount is used for loss detection, but
+			// retransmission doesn't indicate congestion here,
+			// it's just PMTUD.
+			seg.xmitCount = 0
+			if nextSeg == s.writeNext {
+				// We found a segment exceeding the MTU. Rewind
+				// writeNext and try to retransmit it.
+				nextSeg = seg
+			}
 		}
 
 		if s.ep.SACKPermitted && s.ep.scoreboard.IsSACKED(seg.sackBlock()) {
@@ -1566,8 +1572,11 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			// segments (which are always at the end of list) that
 			// have no data, but do consume a sequence number.
 			seg := s.writeList.Front()
-			datalen := seg.logicalLen()
+			if seg == nil {
+				panic(fmt.Sprintf("invalid state: there are %d unacknowledged bytes left, but the write list is empty:\n%+v", ackLeft, s.TCPSenderState))
+			}
 
+			datalen := seg.logicalLen()
 			if datalen > ackLeft {
 				prevCount := s.pCount(seg, s.MaxPayloadSize)
 				seg.TrimFront(ackLeft)

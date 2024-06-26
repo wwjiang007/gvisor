@@ -40,32 +40,36 @@ const MTU = 1500
 
 var _ stack.LinkEndpoint = (*endpoint)(nil)
 
+// +stateify savable
 type endpoint struct {
 	// fd is the underlying AF_XDP socket.
 	fd int
-
-	// addr is the address of the endpoint.
-	addr tcpip.LinkAddress
 
 	// caps holds the endpoint capabilities.
 	caps stack.LinkEndpointCapabilities
 
 	// closed is a function to be called when the FD's peer (if any) closes
 	// its end of the communication pipe.
-	closed func(tcpip.Error)
+	// TODO(b/341946753): Restore when netstack is savable.
+	closed func(tcpip.Error) `state:"nosave"`
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checkloks:mu
 	networkDispatcher stack.NetworkDispatcher
 
 	// wg keeps track of running goroutines.
-	wg sync.WaitGroup
+	wg sync.WaitGroup `state:"nosave"`
 
 	// control is used to control the AF_XDP socket.
 	control *xdp.ControlBlock
 
 	// stopFD is used to stop the dispatch loop.
 	stopFD stopfd.StopFD
+
+	// addr is the address of the endpoint.
+	//
+	// +checklocks:mu
+	addr tcpip.LinkAddress
 }
 
 // Options specify the details about the fd-based endpoint to be created.
@@ -222,6 +226,9 @@ func (ep *endpoint) MTU() uint32 {
 	return MTU
 }
 
+// SetMTU implements stack.LinkEndpoint.SetMTU. It has no impact.
+func (*endpoint) SetMTU(uint32) {}
+
 // Capabilities implements stack.LinkEndpoint.Capabilities.
 func (ep *endpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return ep.caps
@@ -234,7 +241,16 @@ func (ep *endpoint) MaxHeaderLength() uint16 {
 
 // LinkAddress returns the link address of this endpoint.
 func (ep *endpoint) LinkAddress() tcpip.LinkAddress {
+	ep.mu.RLock()
+	defer ep.mu.RUnlock()
 	return ep.addr
+}
+
+// SetLinkAddress implemens stack.LinkEndpoint.SetLinkAddress
+func (ep *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	ep.addr = addr
 }
 
 // Wait implements stack.LinkEndpoint.Wait. It waits for the endpoint to stop
@@ -397,3 +413,6 @@ func (ep *endpoint) dispatch() (bool, tcpip.Error) {
 		}
 	}
 }
+
+// Close implements stack.LinkEndpoint.
+func (*endpoint) Close() {}

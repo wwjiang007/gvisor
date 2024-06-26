@@ -107,26 +107,22 @@ func (p PacketDispatchMode) String() string {
 var _ stack.LinkEndpoint = (*endpoint)(nil)
 var _ stack.GSOEndpoint = (*endpoint)(nil)
 
+// +stateify savable
 type fdInfo struct {
 	fd       int
 	isSocket bool
 }
 
+// +stateify savable
 type endpoint struct {
 	// fds is the set of file descriptors each identifying one inbound/outbound
 	// channel. The endpoint will dispatch from all inbound channels as well as
 	// hash outbound packets to specific channels based on the packet hash.
 	fds []fdInfo
 
-	// mtu (maximum transmission unit) is the maximum size of a packet.
-	mtu uint32
-
 	// hdrSize specifies the link-layer header size. If set to 0, no header
 	// is added/removed; otherwise an ethernet header is used.
 	hdrSize int
-
-	// addr is the address of the endpoint.
-	addr tcpip.LinkAddress
 
 	// caps holds the endpoint capabilities.
 	caps stack.LinkEndpointCapabilities
@@ -137,7 +133,7 @@ type endpoint struct {
 
 	inboundDispatchers []linkDispatcher
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 
@@ -168,9 +164,20 @@ type endpoint struct {
 	// maxSyscallHeaderBytes, it falls back to writing the packet using writev
 	// via WritePacket.)
 	writevMaxIovs int
+
+	// addr is the address of the endpoint.
+	//
+	// +checklocks:mu
+	addr tcpip.LinkAddress
+
+	// mtu (maximum transmission unit) is the maximum size of a packet.
+	// +checklocks:mu
+	mtu uint32
 }
 
 // Options specify the details about the fd-based endpoint to be created.
+//
+// +stateify savable
 type Options struct {
 	// FDs is a set of FDs used to read/write packets.
 	FDs []int
@@ -448,10 +455,18 @@ func (e *endpoint) IsAttached() bool {
 	return e.dispatcher != nil
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
-// during construction.
+// MTU implements stack.LinkEndpoint.MTU.
 func (e *endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+// SetMTU implements stack.LinkEndpoint.SetMTU.
+func (e *endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
@@ -466,7 +481,16 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 
 // LinkAddress returns the link address of this endpoint.
 func (e *endpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.addr
+}
+
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.addr = addr
 }
 
 // Wait implements stack.LinkEndpoint.Wait. It waits for the endpoint to stop
@@ -798,12 +822,17 @@ func (e *endpoint) ARPHardwareType() header.ARPHardwareType {
 	return header.ARPHardwareNone
 }
 
+// Close implements stack.LinkEndpoint.
+func (e *endpoint) Close() {}
+
 // InjectableEndpoint is an injectable fd-based endpoint. The endpoint writes
 // to the FD, but does not read from it. All reads come from injected packets.
+//
+// +satetify savable
 type InjectableEndpoint struct {
 	endpoint
 
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }

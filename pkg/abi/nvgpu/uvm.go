@@ -14,14 +14,6 @@
 
 package nvgpu
 
-// HasRMCtrlFD is a type constraint for UVM parameter structs containing a
-// RMCtrlFD field. This is necessary because, as of this writing (Go 1.20),
-// there is no way to enable field access using a Go type constraint.
-type HasRMCtrlFD interface {
-	GetRMCtrlFD() int32
-	SetRMCtrlFD(int32)
-}
-
 // UVM ioctl commands.
 const (
 	// From kernel-open/nvidia-uvm/uvm_linux_ioctl.h:
@@ -35,6 +27,7 @@ const (
 	UVM_UNREGISTER_GPU_VASPACE         = 26
 	UVM_REGISTER_CHANNEL               = 27
 	UVM_UNREGISTER_CHANNEL             = 28
+	UVM_SET_RANGE_GROUP                = 31
 	UVM_MAP_EXTERNAL_ALLOCATION        = 33
 	UVM_FREE                           = 34
 	UVM_REGISTER_GPU                   = 37
@@ -42,6 +35,7 @@ const (
 	UVM_PAGEABLE_MEM_ACCESS            = 39
 	UVM_SET_PREFERRED_LOCATION         = 42
 	UVM_DISABLE_READ_DUPLICATION       = 45
+	UVM_MIGRATE_RANGE_GROUP            = 53
 	UVM_TOOLS_READ_PROCESS_MEMORY      = 62
 	UVM_TOOLS_WRITE_PROCESS_MEMORY     = 63
 	UVM_MAP_DYNAMIC_PARALLELISM_REGION = 65
@@ -86,11 +80,13 @@ type UVM_REGISTER_GPU_VASPACE_PARAMS struct {
 	RMStatus uint32
 }
 
-func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_REGISTER_GPU_VASPACE_PARAMS) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
@@ -113,11 +109,13 @@ type UVM_REGISTER_CHANNEL_PARAMS struct {
 	Pad0     [4]byte
 }
 
-func (p *UVM_REGISTER_CHANNEL_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_REGISTER_CHANNEL_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_REGISTER_CHANNEL_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_REGISTER_CHANNEL_PARAMS) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
@@ -127,6 +125,15 @@ type UVM_UNREGISTER_CHANNEL_PARAMS struct {
 	HClient  Handle
 	HChannel Handle
 	RMStatus uint32
+}
+
+// +marshal
+type UVM_SET_RANGE_GROUP_PARAMS struct {
+	RangeGroupID  uint64
+	RequestedBase uint64
+	Length        uint64
+	RMStatus      uint32
+	Pad0          [4]byte
 }
 
 // +marshal
@@ -142,11 +149,13 @@ type UVM_MAP_EXTERNAL_ALLOCATION_PARAMS struct {
 	RMStatus           uint32
 }
 
-func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
@@ -163,11 +172,13 @@ type UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550 struct {
 	RMStatus           uint32
 }
 
-func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
@@ -191,11 +202,13 @@ type UVM_REGISTER_GPU_PARAMS struct {
 	RMStatus    uint32
 }
 
-func (p *UVM_REGISTER_GPU_PARAMS) GetRMCtrlFD() int32 {
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *UVM_REGISTER_GPU_PARAMS) GetFrontendFD() int32 {
 	return p.RMCtrlFD
 }
 
-func (p *UVM_REGISTER_GPU_PARAMS) SetRMCtrlFD(fd int32) {
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *UVM_REGISTER_GPU_PARAMS) SetFrontendFD(fd int32) {
 	p.RMCtrlFD = fd
 }
 
@@ -236,6 +249,14 @@ type UVM_DISABLE_READ_DUPLICATION_PARAMS struct {
 	Length        uint64
 	RMStatus      uint32
 	Pad0          [4]byte
+}
+
+// +marshal
+type UVM_MIGRATE_RANGE_GROUP_PARAMS struct {
+	RangeGroupID    uint64
+	DestinationUUID NvUUID
+	RMStatus        uint32
+	Pad0            [4]byte
 }
 
 // +marshal

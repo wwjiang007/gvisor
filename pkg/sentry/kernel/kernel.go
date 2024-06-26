@@ -357,6 +357,18 @@ type Kernel struct {
 	// Mapping: cid -> name.
 	// It's protected by extMu.
 	containerNames map[string]string
+
+	// additionalCheckpointState stores additional state that needs
+	// to be checkpointed. It's protected by extMu.
+	additionalCheckpointState map[any]any
+
+	// Saver registers someone that knows how to save the kernel.
+	saver Saver `state:"nosave"`
+}
+
+// Saver is an interface for saving the kernel.
+type Saver interface {
+	SaveAsync(done func()) error
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -806,6 +818,7 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader, pagesMetadata
 	var pr *statefile.AsyncReader
 	if pagesFile != nil {
 		pr = statefile.NewAsyncReader(pagesFile, 0 /* off */)
+		defer pr.Close()
 	}
 	if err := k.mf.LoadFrom(ctx, pmr, pr); err != nil {
 		return err
@@ -814,7 +827,7 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader, pagesMetadata
 		return err
 	}
 	if pr != nil {
-		if err := pr.Close(); err != nil {
+		if err := pr.Wait(); err != nil {
 			return err
 		}
 	}
@@ -1214,10 +1227,11 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 		// This means we'll iterate FDTables shared by multiple tasks repeatedly,
 		// but ktime.Timer.Pause is idempotent so this is harmless.
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.PauseTimer()
 				}
+				return true
 			})
 		}
 	}
@@ -1244,10 +1258,11 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 			}
 		}
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+			t.fdTable.ForEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) bool {
 				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
 					tfd.ResumeTimer()
 				}
+				return true
 			})
 		}
 	}
@@ -1349,6 +1364,11 @@ func (k *Kernel) Pause() {
 	k.extMu.Unlock()
 	k.tasks.runningGoroutines.Wait()
 	k.tasks.aioGoroutines.Wait()
+}
+
+// IsPaused returns true if the kernel is currently paused.
+func (k *Kernel) IsPaused() bool {
+	return k.tasks.isExternallyStopped()
 }
 
 // ReceiveTaskStates receives full states for all tasks.
@@ -1794,6 +1814,28 @@ func (k *Kernel) SetHostMount(mnt *vfs.Mount) {
 	k.hostMount = mnt
 }
 
+// AddStateToCheckpoint adds a key-value pair to be additionally checkpointed.
+func (k *Kernel) AddStateToCheckpoint(key, v any) {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	if k.additionalCheckpointState == nil {
+		k.additionalCheckpointState = make(map[any]any)
+	}
+	k.additionalCheckpointState[key] = v
+}
+
+// PopCheckpointState pops a key-value pair from the additional checkpoint
+// state. If the key doesn't exist, nil is returned.
+func (k *Kernel) PopCheckpointState(key any) any {
+	k.extMu.Lock()
+	defer k.extMu.Unlock()
+	if v, ok := k.additionalCheckpointState[key]; ok {
+		delete(k.additionalCheckpointState, key)
+		return v
+	}
+	return nil
+}
+
 // HostMount returns the hostfs mount.
 func (k *Kernel) HostMount() *vfs.Mount {
 	return k.hostMount
@@ -1876,6 +1918,7 @@ func (k *Kernel) Release() {
 	k.rootIPCNamespace.DecRef(ctx)
 	k.rootUTSNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
+	k.mf.Destroy()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -2051,4 +2094,16 @@ func (k *Kernel) ContainerName(cid string) string {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 	return k.containerNames[cid]
+}
+
+// SetSaver sets the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) SetSaver(s Saver) {
+	k.saver = s
+}
+
+// Saver returns the kernel's Saver.
+// Thread-compatible.
+func (k *Kernel) Saver() Saver {
+	return k.saver
 }

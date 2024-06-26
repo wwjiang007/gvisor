@@ -74,6 +74,16 @@ type IoctlAllocOSEvent struct {
 	Status  uint32
 }
 
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *IoctlAllocOSEvent) GetFrontendFD() int32 {
+	return int32(p.FD)
+}
+
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *IoctlAllocOSEvent) SetFrontendFD(fd int32) {
+	p.FD = uint32(fd)
+}
+
 // IoctlFreeOSEvent is nv_ioctl_free_os_event_t, the parameter type for
 // NV_ESC_FREE_OS_EVENT.
 //
@@ -83,6 +93,16 @@ type IoctlFreeOSEvent struct {
 	HDevice Handle
 	FD      uint32
 	Status  uint32
+}
+
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *IoctlFreeOSEvent) GetFrontendFD() int32 {
+	return int32(p.FD)
+}
+
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *IoctlFreeOSEvent) SetFrontendFD(fd int32) {
+	p.FD = uint32(fd)
 }
 
 // RMAPIVersion is nv_rm_api_version_t, the parameter type for
@@ -150,6 +170,7 @@ type NVOS00Parameters struct {
 // RmAllocParamType should be implemented by all possible parameter types for
 // NV_ESC_RM_ALLOC.
 type RmAllocParamType interface {
+	GetHClass() ClassID
 	GetPAllocParms() P64
 	GetPRightsRequested() P64
 	SetPAllocParms(p P64)
@@ -181,6 +202,11 @@ type NVOS21Parameters struct {
 	PAllocParms   P64
 	ParamsSize    uint32
 	Status        uint32
+}
+
+// GetHClass implements RmAllocParamType.GetHClass.
+func (n *NVOS21Parameters) GetHClass() ClassID {
+	return n.HClass
 }
 
 // GetPAllocParms implements RmAllocParamType.GetPAllocParms.
@@ -383,6 +409,11 @@ type NVOS64Parameters struct {
 	_                uint32
 }
 
+// GetHClass implements RmAllocParamType.GetHClass.
+func (n *NVOS64Parameters) GetHClass() ClassID {
+	return n.HClass
+}
+
 // GetPAllocParms implements RmAllocParamType.GetPAllocParms.
 func (n *NVOS64Parameters) GetPAllocParms() P64 {
 	return n.PAllocParms
@@ -404,6 +435,14 @@ func (n *NVOS64Parameters) FromOS64(other NVOS64Parameters) { *n = other }
 
 // ToOS64 implements RmAllocParamType.ToOS64.
 func (n *NVOS64Parameters) ToOS64() NVOS64Parameters { return *n }
+
+// HasFrontendFD is a type constraint for parameter structs containing a
+// frontend FD field. This is necessary because, as of this writing (Go 1.20),
+// there is no way to enable field access using a Go type constraint.
+type HasFrontendFD interface {
+	GetFrontendFD() int32
+	SetFrontendFD(int32)
+}
 
 // Frontend ioctl parameter struct sizes.
 var (

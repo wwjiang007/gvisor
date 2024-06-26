@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
+// +stateify savable
 type linkResolver struct {
 	resolver LinkAddressResolver
 
@@ -34,6 +35,8 @@ var _ NetworkDispatcher = (*nic)(nil)
 
 // nic represents a "network interface card" to which the networking stack is
 // attached.
+//
+// +stateify savable
 type nic struct {
 	NetworkLinkEndpoint
 
@@ -47,7 +50,7 @@ type nic struct {
 	// enableDisableMu is used to synchronize attempts to enable/disable the NIC.
 	// Without this mutex, calls to enable/disable the NIC may interleave and
 	// leave the NIC in an inconsistent state.
-	enableDisableMu nicRWMutex
+	enableDisableMu nicRWMutex `state:"nosave"`
 
 	// The network endpoints themselves may be modified by calling the interface's
 	// methods, but the map reference and entries must be constant.
@@ -69,7 +72,7 @@ type nic struct {
 	linkResQueue packetsPendingLinkResolution
 
 	// packetEPsMu protects annotated fields below.
-	packetEPsMu packetEPsRWMutex
+	packetEPsMu packetEPsRWMutex `state:"nosave"`
 
 	// eps is protected by the mutex, but the values contained in it are not.
 	//
@@ -84,6 +87,9 @@ type nic struct {
 	// deliverLinkPackets is off by default because some users already
 	// deliver link packets by explicitly calling nic.DeliverLinkPackets.
 	deliverLinkPackets bool
+
+	// Primary is the main controlling interface in a bonded setup.
+	Primary *nic
 }
 
 // makeNICStats initializes the NIC statistics and associates them to the global
@@ -95,6 +101,7 @@ func makeNICStats(global tcpip.NICStats) sharedStats {
 	return stats
 }
 
+// +stateify savable
 type packetEndpointList struct {
 	mu packetEndpointListRWMutex
 
@@ -138,6 +145,7 @@ func (p *packetEndpointList) forEach(fn func(PacketEndpoint)) {
 
 var _ QueueingDiscipline = (*delegatingQueueingDiscipline)(nil)
 
+// +stateify savable
 type delegatingQueueingDiscipline struct {
 	LinkWriter
 }
@@ -321,6 +329,7 @@ func (n *nic) remove() tcpip.Error {
 	// Prevent packets from going down to the link before shutting the link down.
 	n.qDisc.Close()
 	n.NetworkLinkEndpoint.Attach(nil)
+	n.NetworkLinkEndpoint.Close()
 
 	return nil
 }
@@ -1073,4 +1082,12 @@ func (n *nic) multicastForwarding(protocol tcpip.NetworkProtocolNumber) (bool, t
 	}
 
 	return ep.MulticastForwarding(), nil
+}
+
+// CoordinatorNIC represents NetworkLinkEndpoint that can join multiple network devices.
+type CoordinatorNIC interface {
+	// AddNIC adds the specified NIC device.
+	AddNIC(n *nic) tcpip.Error
+	// DelNIC deletes the specified NIC device.
+	DelNIC(n *nic) tcpip.Error
 }

@@ -702,12 +702,12 @@ func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 
 // Checkpoint sends the checkpoint call to the container.
 // The statefile will be written to f, the file at the specified image-path.
-func (c *Container) Checkpoint(imagePath string, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
+func (c *Container) Checkpoint(imagePath string, direct bool, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
 	log.Debugf("Checkpoint container, cid: %s", c.ID)
 	if err := c.requireStatus("checkpoint", Created, Running, Paused); err != nil {
 		return err
 	}
-	return c.Sandbox.Checkpoint(c.ID, imagePath, sfOpts, mfOpts)
+	return c.Sandbox.Checkpoint(c.ID, imagePath, direct, sfOpts, mfOpts)
 }
 
 // Pause suspends the container and its kernel.
@@ -1615,6 +1615,23 @@ func (c *Container) populateStats(event *boot.EventOut) {
 	return
 }
 
+func (c *Container) createParentCgroup(parentPath string, conf *config.Config) (cgroup.Cgroup, error) {
+	var err error
+	if conf.SystemdCgroup {
+		parentPath, err = cgroup.TransformSystemdPath(parentPath, c.ID, conf.Rootless)
+		if err != nil {
+			return nil, err
+		}
+	} else if cgroup.LikelySystemdPath(parentPath) {
+		log.Warningf("cgroup parent path is set to %q which looks like a systemd path. Please set --systemd-cgroup=true if you intend to use systemd to manage container cgroups", parentPath)
+	}
+	parentCgroup, err := cgroup.NewFromPath(parentPath, conf.SystemdCgroup)
+	if err != nil {
+		return nil, err
+	}
+	return parentCgroup, nil
+}
+
 // setupCgroupForRoot configures and returns cgroup for the sandbox and the
 // root container. If `cgroupParentAnnotation` is set, use that path as the
 // sandbox cgroup and use Spec.Linux.CgroupsPath as the root container cgroup.
@@ -1622,13 +1639,16 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (c
 	var parentCgroup cgroup.Cgroup
 	if parentPath, ok := spec.Annotations[cgroupParentAnnotation]; ok {
 		var err error
-		parentCgroup, err = cgroup.NewFromPath(parentPath, conf.SystemdCgroup)
+		parentCgroup, err = c.createParentCgroup(parentPath, conf)
 		if err != nil {
 			return nil, nil, err
 		}
 	} else {
 		var err error
-		parentCgroup, err = cgroup.NewFromSpec(spec, conf.SystemdCgroup)
+		if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
+			return nil, nil, nil
+		}
+		parentCgroup, err = c.createParentCgroup(spec.Linux.CgroupsPath, conf)
 		if parentCgroup == nil || err != nil {
 			return nil, nil, err
 		}
@@ -1659,7 +1679,10 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 		}
 	}
 
-	cg, err := cgroup.NewFromSpec(spec, conf.SystemdCgroup)
+	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
+		return nil, nil
+	}
+	cg, err := c.createParentCgroup(spec.Linux.CgroupsPath, conf)
 	if cg == nil || err != nil {
 		return nil, err
 	}

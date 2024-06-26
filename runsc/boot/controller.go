@@ -72,6 +72,12 @@ const (
 	// ContMgrRestoreSubcontainer restores a container from a statefile.
 	ContMgrRestoreSubcontainer = "containerManager.RestoreSubcontainer"
 
+	// ContMgrPause pauses all tasks, blocking until they are stopped.
+	ContMgrPause = "containerManager.Pause"
+
+	// ContMgrResume resumes all tasks.
+	ContMgrResume = "containerManager.Resume"
+
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
 
@@ -130,12 +136,6 @@ const (
 	LoggingChange = "Logging.Change"
 )
 
-// Lifecycle related commands (see lifecycle.go for more details).
-const (
-	LifecyclePause  = "Lifecycle.Pause"
-	LifecycleResume = "Lifecycle.Resume"
-)
-
 // Usage related commands (see usage.go for more details).
 const (
 	UsageCollect = "Usage.Collect"
@@ -180,29 +180,42 @@ func newController(fd int, l *Loader) (*controller, error) {
 		},
 		srv: srv,
 	}
-	ctrl.srv.Register(ctrl.manager)
-	ctrl.srv.Register(&control.Cgroups{Kernel: l.k})
-	ctrl.srv.Register(&control.Lifecycle{Kernel: l.k})
-	ctrl.srv.Register(&control.Logging{})
-	ctrl.srv.Register(&control.Proc{Kernel: l.k})
-	ctrl.srv.Register(&control.State{Kernel: l.k})
-	ctrl.srv.Register(&control.Usage{Kernel: l.k})
-	ctrl.srv.Register(&control.Metrics{})
-	ctrl.srv.Register(&debug{})
+	ctrl.registerHandlers()
+	return ctrl, nil
+}
+
+func (c *controller) registerHandlers() {
+	l := c.manager.l
+	c.srv.Register(c.manager)
+	c.srv.Register(&control.Cgroups{Kernel: l.k})
+	c.srv.Register(&control.Lifecycle{Kernel: l.k})
+	c.srv.Register(&control.Logging{})
+	c.srv.Register(&control.Proc{Kernel: l.k})
+	c.srv.Register(&control.State{Kernel: l.k})
+	c.srv.Register(&control.Usage{Kernel: l.k})
+	c.srv.Register(&control.Metrics{})
+	c.srv.Register(&debug{})
 
 	if eps, ok := l.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
-		ctrl.srv.Register(&Network{
+		c.srv.Register(&Network{
 			Stack:  eps.Stack,
 			Kernel: l.k,
 		})
 	}
 	if l.root.conf.ProfileEnable {
-		ctrl.srv.Register(control.NewProfile(l.k))
+		c.srv.Register(control.NewProfile(l.k))
 	}
-	return ctrl, nil
 }
 
-// stopRPCTimeout is the time for clients to complete ongoing RPCs.
+// refreshHandlers resets the server and re-registers all handlers using l.
+// Useful when l.k has been replaced (e.g. during a restore).
+func (c *controller) refreshHandlers() {
+	c.srv.ResetServer()
+	c.registerHandlers()
+}
+
+// stopRPCTimeout is the time for clients to finish making any RPCs. Note that
+// ongoing RPCs after this timeout still run to completion.
 const stopRPCTimeout = 15 * gtime.Second
 
 func (c *controller) stop() {
@@ -501,14 +514,12 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 		if err != nil {
 			return err
 		}
-		defer cm.restorer.pagesMetadata.Close()
 		fileIdx++
 
 		cm.restorer.pagesFile, err = o.ReleaseFD(fileIdx)
 		if err != nil {
 			return err
 		}
-		defer cm.restorer.pagesFile.Close()
 		fileIdx++
 	}
 
@@ -642,6 +653,18 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) er
 	}
 	log.Debugf("Container restored, cid: %s", args.CID)
 	return nil
+}
+
+// Pause pauses all tasks, blocking until they are stopped.
+func (cm *containerManager) Pause(_, _ *struct{}) error {
+	cm.l.k.Pause()
+	return nil
+}
+
+// Resume resumes all tasks.
+func (cm *containerManager) Resume(_, _ *struct{}) error {
+	cm.l.k.Unpause()
+	return postResumeImpl(cm.l.k)
 }
 
 // Wait waits for the init process in the given container.

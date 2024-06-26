@@ -168,6 +168,36 @@ func findUIDGIDInPasswd(passwd io.Reader, user string) (auth.KUID, auth.KGID, er
 	uid := defaultUID
 	gid := defaultGID
 
+	// Per 'man 5 passwd'
+	// /etc/passwd contains one line for each user account, with seven
+	// fields delimited by colons (“:”). These fields are:
+	//
+	//	- login name
+	//	- optional encrypted password
+	//	- numerical user ID
+	//	- numerical group ID
+	//	- Gecos field
+	//	- user home directory
+	//	- optional user command interpreter
+	const (
+		numFields = 7
+		userIdx   = 0
+		passwdIdx = 1
+		uidIdx    = 2
+		gidIdx    = 3
+		gecosIdx  = 4
+		shellIdx  = 6
+	)
+	usergroup := strings.SplitN(user, ":", 2)
+	uStringOrID := usergroup[0]
+
+	// Check if we have a uid or string for user.
+	idxToMatch := uidIdx
+	_, err := strconv.Atoi(uStringOrID)
+	if err != nil {
+		idxToMatch = userIdx
+	}
+
 	s := bufio.NewScanner(passwd)
 	for s.Scan() {
 		if err := s.Err(); err != nil {
@@ -175,47 +205,28 @@ func findUIDGIDInPasswd(passwd io.Reader, user string) (auth.KUID, auth.KGID, er
 		}
 
 		line := strings.TrimSpace(s.Text())
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Per 'man 5 passwd'
-		// /etc/passwd contains one line for each user account, with seven
-		// fields delimited by colons (“:”). These fields are:
-		//
-		//	- login name
-		//	- optional encrypted password
-		//	- numerical user ID
-		//	- numerical group ID
-		//	- user name or comment field
-		//	- user home directory
-		//	- optional user command interpreter
-		const (
-			numFields = 7
-			userIdx   = 0
-			passwdIdx = 1
-			uidIdx    = 2
-			gidIdx    = 3
-			shellIdx  = 6
-		)
 		parts := strings.Split(line, ":")
 		if len(parts) != numFields {
 			// Return error if the format is invalid.
-			return defaultUID, defaultGID, fmt.Errorf("invalid line found in /etc/passwd")
+			return defaultUID, defaultGID, fmt.Errorf("invalid line found in /etc/passwd, there should be 7 fields but found %v", len(parts))
 		}
 		for i := 0; i < numFields; i++ {
-			// The password and user command interpreter fields are
+			// The password, GECOS and user command interpreter fields are
 			// optional, no need to check if they are empty.
-			if i == passwdIdx || i == shellIdx {
+			if i == passwdIdx || i == shellIdx || i == gecosIdx {
 				continue
 			}
 			if parts[i] == "" {
 				// Return error if the format is invalid.
-				return defaultUID, defaultGID, fmt.Errorf("invalid line found in /etc/passwd")
+				return defaultUID, defaultGID, fmt.Errorf("invalid line found in /etc/passwd, field[%v] is empty", i)
 			}
 		}
 
-		if parts[userIdx] == user {
+		if parts[idxToMatch] == uStringOrID {
 			parseUID, err := strconv.ParseUint(parts[uidIdx], 10, 32)
 			if err != nil {
 				return defaultUID, defaultGID, err
