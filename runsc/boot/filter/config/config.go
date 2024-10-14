@@ -25,10 +25,10 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
-	"gvisor.dev/gvisor/pkg/sentry/devices/accel"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 )
 
 // Options are seccomp filter related options.
@@ -41,6 +41,8 @@ type Options struct {
 	NVProxy               bool
 	TPUProxy              bool
 	ControllerFD          uint32
+	CgoEnabled            bool
+	PluginNetwork         bool
 }
 
 // isInstrumentationEnabled returns whether there are any
@@ -66,6 +68,8 @@ func (opt Options) ConfigKey() string {
 	sb.WriteString(fmt.Sprintf("Instrumentation=%t ", isInstrumentationEnabled()))
 	sb.WriteString(fmt.Sprintf("NVProxy=%t ", opt.NVProxy))
 	sb.WriteString(fmt.Sprintf("TPUProxy=%t ", opt.TPUProxy))
+	sb.WriteString(fmt.Sprintf("CgoEnabled=%t ", opt.CgoEnabled))
+	sb.WriteString(fmt.Sprintf("PluginNetwork=%t ", opt.PluginNetwork))
 	return strings.TrimSpace(sb.String())
 }
 
@@ -94,6 +98,12 @@ func Warnings(opt Options) []string {
 	}
 	if opt.TPUProxy {
 		warnings = append(warnings, "TPU device proxy enabled: syscall filters less restrictive!")
+	}
+	if opt.CgoEnabled {
+		warnings = append(warnings, "CGO enabled: syscall filters less restrictive!")
+	}
+	if opt.PluginNetwork {
+		warnings = append(warnings, "plugin network stack enabled: syscall filters less restrictive!")
 	}
 	return warnings
 }
@@ -140,8 +150,13 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 		s.Merge(nvproxy.Filters())
 	}
 	if opt.TPUProxy {
-		s.Merge(accel.Filters())
 		s.Merge(tpuproxy.Filters())
+	}
+	if opt.CgoEnabled {
+		s.Merge(cgoFilters())
+	}
+	if opt.PluginNetwork {
+		s.Merge(plugin.SeccompFilters())
 	}
 
 	s.Merge(opt.Platform.SyscallFilters(vars))

@@ -30,10 +30,10 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -253,12 +253,18 @@ func New(opts Options) (stack.LinkEndpoint, error) {
 	return e, nil
 }
 
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (e *endpoint) SetOnCloseAction(func()) {}
+
 // Close frees most resources associated with the endpoint. Wait() must be
 // called after Close() in order to free the rest.
 func (e *endpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that
 	// it wakes up in case it's sleeping.
-	e.stopRequested.Store(1)
+	if e.stopRequested.Swap(1) == 1 {
+		// It is already closed.
+		return
+	}
 	e.rx.eventFD.Notify()
 
 	// Cleanup the queues inline if the worker hasn't started yet; we also
@@ -300,9 +306,13 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 				b := make([]byte, 1)
 				// When sharedmem endpoint is in use the peerFD is never used for any data
 				// transfer and this Read should only return if the peer is shutting down.
-				_, err := rawfile.BlockingRead(e.peerFD, b)
+				_, errno := rawfile.BlockingRead(e.peerFD, b)
 				if e.onClosed != nil {
-					e.onClosed(err)
+					if errno == 0 {
+						e.onClosed(nil)
+					} else {
+						e.onClosed(tcpip.TranslateErrno(errno))
+					}
 				}
 			}()
 		}

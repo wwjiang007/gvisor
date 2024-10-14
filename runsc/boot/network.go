@@ -21,12 +21,14 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
+	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
@@ -71,6 +73,10 @@ var (
 type Network struct {
 	Stack  *stack.Stack
 	Kernel *kernel.Kernel
+
+	// PluginStack is a third-party network stack to use in place of
+	// netstack when non-nil.
+	PluginStack plugin.PluginStack
 }
 
 // Route represents a route in the network stack.
@@ -184,6 +190,13 @@ type CreateLinksAndRoutesArgs struct {
 	DisconnectOk bool
 }
 
+// InitPluginStackArgs are arguments to InitPluginStack.
+type InitPluginStackArgs struct {
+	urpc.FilePayload
+
+	InitStr string
+}
+
 // IPWithPrefix is an address with its subnet prefix length.
 type IPWithPrefix struct {
 	// Address is a network address.
@@ -212,6 +225,31 @@ func (r *Route) toTcpipRoute(id tcpip.NICID) (tcpip.Route, error) {
 		Gateway:     ipToAddress(r.Gateway),
 		NIC:         id,
 	}, nil
+}
+
+// InitPluginStack initializes plugin network stack.
+// It will invoke Init() that is registered by current plugin stack.
+func (n *Network) InitPluginStack(args *InitPluginStackArgs, _ *struct{}) error {
+	pluginStack := n.PluginStack
+	if pluginStack == nil {
+		return fmt.Errorf("plugin stack is not registered")
+	}
+
+	fdNum := len(args.FilePayload.Files)
+	fds := make([]int, fdNum)
+	for i := 0; i < fdNum; i++ {
+		oldFD := args.FilePayload.Files[i].Fd()
+		if newFD, err := syscall.Dup(int(oldFD)); err != nil {
+			return fmt.Errorf("failed to dup FD")
+		} else {
+			fds[i] = newFD
+		}
+	}
+
+	return pluginStack.Init(&plugin.InitStackArgs{
+		InitStr: args.InitStr,
+		FDs:     fds,
+	})
 }
 
 // CreateLinksAndRoutes creates links and routes in a network stack.  It should
@@ -247,7 +285,6 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 		return fmt.Errorf("args.FilePayload.Files has %d FDs but we need %d entries based on FDBasedLinks, XDPLinks, and PCAP", got, wantFDs)
 	}
 
-	var nicID tcpip.NICID
 	nicids := make(map[string]tcpip.NICID)
 
 	// Collect routes from all links.
@@ -255,7 +292,7 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 
 	// Loopback normally appear before other interfaces.
 	for _, link := range args.LoopbackLinks {
-		nicID = tcpip.NICID(n.Stack.UniqueID())
+		nicID := n.Stack.NextNICID()
 		nicids[link.Name] = nicID
 
 		linkEP := ethernet.New(loopback.New())
@@ -298,7 +335,7 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 		}
 
 		for _, link := range args.FDBasedLinks {
-			nicID++
+			nicID := n.Stack.NextNICID()
 			nicids[link.Name] = nicID
 
 			FDs := make([]int, 0, link.NumChannels)
@@ -387,7 +424,7 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 			return fmt.Errorf("XDP only supports one link device, but got %d", nlinks)
 		}
 		link := args.XDPLinks[0]
-		nicID++
+		nicID := n.Stack.NextNICID()
 		nicids[link.Name] = nicID
 
 		// Get the AF_XDP socket.

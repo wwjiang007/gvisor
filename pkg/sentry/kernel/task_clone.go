@@ -201,7 +201,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	mntns := t.mountNamespace
 	if args.Flags&linux.CLONE_NEWNS != 0 {
 		var err error
-		mntns, err = t.k.vfs.CloneMountNamespace(t, creds, mntns, &fsContext.root, &fsContext.cwd, t.k)
+		mntns, err = t.k.vfs.CloneMountNamespace(t, userns, mntns, &fsContext.root, &fsContext.cwd, t.k)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -396,8 +396,8 @@ func getCloneSeccheckInfo(t, nt *Task, flags uint64) (seccheck.FieldSet, *pb.Clo
 //
 // Preconditions: The caller must be running on t's task goroutine.
 func (t *Task) maybeBeginVforkStop(child *Task) {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
+	t.tg.pidns.owner.mu.Lock()
+	defer t.tg.pidns.owner.mu.Unlock()
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
 	if t.killedLocked() {
@@ -410,8 +410,8 @@ func (t *Task) maybeBeginVforkStop(child *Task) {
 }
 
 func (t *Task) unstopVforkParent() {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
+	t.tg.pidns.owner.mu.Lock()
+	defer t.tg.pidns.owner.mu.Unlock()
 	if p := t.vforkParent; p != nil {
 		p.tg.signalHandlers.mu.Lock()
 		defer p.tg.signalHandlers.mu.Unlock()
@@ -666,7 +666,7 @@ func (t *Task) Unshare(flags int32) error {
 			return linuxerr.EPERM
 		}
 		oldMountNS := t.mountNamespace
-		mntns, err := t.k.vfs.CloneMountNamespace(t, creds, oldMountNS, &t.fsContext.root, &t.fsContext.cwd, t.k)
+		mntns, err := t.k.vfs.CloneMountNamespace(t, creds.UserNamespace, oldMountNS, &t.fsContext.root, &t.fsContext.cwd, t.k)
 		if err != nil {
 			return err
 		}

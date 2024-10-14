@@ -292,7 +292,7 @@ type Task struct {
 	//
 	// exitState is protected by the TaskSet mutex. exitState is owned by the
 	// task goroutine.
-	exitState TaskExitState
+	exitState atomicbitops.Uint32
 
 	// exitTracerNotified is true if the exit path has either signaled the
 	// task's tracer to indicate the exit, or determined that no such signal is
@@ -617,12 +617,18 @@ var (
 	// syscallCounter is a metric that tracks how many syscalls the sentry has
 	// executed.
 	syscallCounter = metric.SentryProfiling.MustCreateNewUint64Metric(
-		"/task/syscalls", false, "The number of syscalls the sentry has executed for the user.")
+		"/task/syscalls", metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of syscalls the sentry has executed for the user.",
+		})
 
 	// faultCounter is a metric that tracks how many faults the sentry has had to
 	// handle.
 	faultCounter = metric.SentryProfiling.MustCreateNewUint64Metric(
-		"/task/faults", false, "The number of faults the sentry has handled.")
+		"/task/faults", metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: "The number of faults the sentry has handled.",
+		})
 )
 
 func (t *Task) savePtraceTracer() *Task {

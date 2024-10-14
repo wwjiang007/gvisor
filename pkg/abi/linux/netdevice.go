@@ -85,6 +85,9 @@ type IFConf struct {
 	Ptr uint64
 }
 
+// SizeOfIFConf is the binary size of an IFConf struct (16 bytes).
+var SizeOfIFConf = (*IFConf)(nil).SizeBytes()
+
 // EthtoolCmd is a marshallable type to be able to easily copyin the
 // the command for an SIOCETHTOOL ioctl.
 //
@@ -118,3 +121,8 @@ type EthtoolGetFeaturesBlock struct {
 	Active       uint32
 	NeverChanged uint32
 }
+
+const (
+	// LOOPBACK_IFINDEX is defined in include/net/flow.h.
+	LOOPBACK_IFINDEX = 1
+)

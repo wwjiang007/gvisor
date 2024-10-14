@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -47,8 +46,10 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/donation"
+	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
 )
 
 const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
@@ -241,6 +242,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Lock the container metadata file to prevent concurrent creations of
 	// containers with the same id.
 	if err := c.Saver.LockForNew(); err != nil {
+		// As we have not allocated any resources yet, we revoke the clean-up operation.
+		// Otherwise, we may accidently destroy an existing container.
+		cu.Release()
 		return nil, fmt.Errorf("cannot lock container metadata file: %w", err)
 	}
 	defer c.Saver.UnlockOrDie()
@@ -411,7 +415,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Write the PID file. Containerd considers the call to create complete after
 	// this file is created, so it must be the last thing we do.
 	if args.PIDFile != "" {
-		if err := ioutil.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0644); err != nil {
+		if err := os.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0644); err != nil {
 			return nil, fmt.Errorf("error writing PID file: %v", err)
 		}
 	}
@@ -428,11 +432,11 @@ func (c *Container) Start(conf *config.Config) error {
 
 // Restore takes a container and replaces its kernel and file system
 // to restore a container from its state file.
-func (c *Container) Restore(conf *config.Config, imagePath string, direct bool) error {
+func (c *Container) Restore(conf *config.Config, imagePath string, direct, background bool) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
 
 	restore := func(conf *config.Config) error {
-		return c.Sandbox.Restore(conf, c.ID, imagePath, direct)
+		return c.Sandbox.Restore(conf, c.ID, imagePath, direct, background)
 	}
 	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
 }
@@ -649,6 +653,18 @@ func (c *Container) WaitPID(pid int32) (unix.WaitStatus, error) {
 		return 0, fmt.Errorf("sandbox is not running")
 	}
 	return c.Sandbox.WaitPID(c.ID, pid)
+}
+
+// WaitCheckpoint waits for the Kernel to have been successfully checkpointed
+// n-1 times, then waits for either the n-th successful checkpoint (in which
+// case it returns nil) or any number of failed checkpoints (in which case it
+// returns an error returned by any such failure).
+func (c *Container) WaitCheckpoint(n uint32) error {
+	log.Debugf("Wait on %d-th checkpoint to complete in container, cid: %s", n, c.ID)
+	if !c.IsSandboxRunning() {
+		return fmt.Errorf("sandbox is not running")
+	}
+	return c.Sandbox.WaitCheckpoint(n)
 }
 
 // SignalContainer sends the signal to the container. If all is true and signal
@@ -872,7 +888,7 @@ func (c *Container) Destroy() error {
 	if len(errs) == 0 {
 		return nil
 	}
-	return fmt.Errorf(strings.Join(errs, "\n"))
+	return fmt.Errorf("%s", strings.Join(errs, "\n"))
 }
 
 func (c *Container) sandboxID() string {
@@ -1200,7 +1216,18 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 			}
 		}
 		if specutils.IsDebugCommand(conf, "gofer") {
-			if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "gofer", test); err != nil {
+			// The startTime here can mean one of two things:
+			// - If this is the first gofer started at the same time as the sandbox,
+			//   then this starttime will exactly match the one used by the sandbox
+			//   itself (i.e. `Sandbox.StartTime`). This is desirable, such that the
+			//   first gofer's log filename will have the exact same timestamp as
+			//   the sandbox's log filename timestamp.
+			// - If this is not the first gofer, then this starttime will be later
+			//   than the sandbox start time; this is desirable such that we can
+			//   distinguish the gofer log filenames between each other.
+			// In either case, `starttime.Get` gets us the timestamp we want.
+			startTime := starttime.Get()
+			if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "gofer", test, startTime); err != nil {
 				return nil, nil, nil, err
 			}
 		}
@@ -1701,6 +1728,7 @@ func (c *Container) donateGoferProfileFDs(conf *config.Config, donations *donati
 	// into a single file.
 	profSuffix := ".gofer." + c.ID
 	const profFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	profile.UpdatePaths(conf, starttime.Get())
 	if conf.ProfileBlock != "" {
 		if err := donations.OpenAndDonate("profile-block-fd", conf.ProfileBlock+profSuffix, profFlags); err != nil {
 			return err
@@ -1982,12 +2010,20 @@ func nvproxySetupAfterGoferUserns(spec *specs.Spec, conf *config.Config, goferCm
 			"configure",
 			fmt.Sprintf("--ldconfig=@%s", ldconfigPath),
 			"--no-cgroups", // runsc doesn't configure device cgroups yet
-			"--utility",
-			"--compute",
 			fmt.Sprintf("--pid=%d", goferCmd.Process.Pid),
 			fmt.Sprintf("--device=%s", devices),
-			spec.Root.Path,
 		}
+		// Pass driver capabilities specified via NVIDIA_DRIVER_CAPABILITIES as flags. See
+		// nvidia-container-toolkit/cmd/nvidia-container-runtime-hook/main.go:doPrestart().
+		driverCaps, err := specutils.NVProxyDriverCapsFromEnv(spec, conf)
+		if err != nil {
+			return fmt.Errorf("failed to get driver capabilities: %w", err)
+		}
+		for cap := range driverCaps {
+			argv = append(argv, cap.ToFlag())
+		}
+		// Add rootfs path as the final argument.
+		argv = append(argv, spec.Root.Path)
 		log.Debugf("Executing %q", argv)
 		var stdout, stderr strings.Builder
 		cmd := exec.Cmd{

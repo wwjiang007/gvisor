@@ -20,13 +20,14 @@ package sharedmem
 import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+// +stateify savable
 type serverEndpoint struct {
 	// bufferSize is the size of each individual buffer.
 	// bufferSize is immutable.
@@ -39,7 +40,7 @@ type serverEndpoint struct {
 	stopRequested atomicbitops.Uint32
 
 	// Wait group used to indicate that all workers have stopped.
-	completed sync.WaitGroup
+	completed sync.WaitGroup `state:"nosave"`
 
 	// peerFD is an fd to the peer that can be used to detect when the peer is
 	// gone.
@@ -59,10 +60,10 @@ type serverEndpoint struct {
 
 	// onClosed is a function to be called when the FD's peer (if any) closes its
 	// end of the communication pipe.
-	onClosed func(tcpip.Error)
+	onClosed func(tcpip.Error) `state:"nosave"`
 
 	// mu protects the following fields.
-	mu sync.RWMutex
+	mu sync.RWMutex `state:"nosave"`
 
 	// tx is the transmit queue.
 	// +checklocks:mu
@@ -118,6 +119,9 @@ func NewServerEndpoint(opts Options) (stack.LinkEndpoint, error) {
 	return e, nil
 }
 
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*serverEndpoint) SetOnCloseAction(func()) {}
+
 // Close frees all resources associated with the endpoint.
 func (e *serverEndpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that it wakes
@@ -158,9 +162,13 @@ func (e *serverEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 				// When sharedmem endpoint is in use the peerFD is never used for any
 				// data transfer and this Read should only return if the peer is
 				// shutting down.
-				_, err := rawfile.BlockingRead(e.peerFD, b)
+				_, errno := rawfile.BlockingRead(e.peerFD, b)
 				if e.onClosed != nil {
-					e.onClosed(err)
+					if errno == 0 {
+						e.onClosed(nil)
+					} else {
+						e.onClosed(tcpip.TranslateErrno(errno))
+					}
 				}
 				e.completed.Done()
 			}()

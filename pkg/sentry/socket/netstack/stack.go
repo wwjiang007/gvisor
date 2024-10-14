@@ -40,7 +40,14 @@ import (
 //
 // +stateify savable
 type Stack struct {
-	Stack *stack.Stack `state:"manual"`
+	Stack                  *stack.Stack `state:".(*stack.Stack)"`
+	shouldSaveRestoreStack bool
+}
+
+// EnableSaveRestore enables netstack s/r.
+func (s *Stack) EnableSaveRestore() error {
+	s.shouldSaveRestoreStack = true
+	return nil
 }
 
 // Destroy implements inet.Stack.Destroy.
@@ -123,20 +130,21 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 			if len(value) < 1 {
 				return syserr.ErrInvalidArgument
 			}
-			if ifinfomsg.Index != 0 {
-				// Device name changing isn't supported yet.
-				return syserr.ErrNotSupported
-			}
-			ifname = value.String()
-			for idx, ifa := range s.Interfaces() {
-				if ifname == ifa.Name {
-					ifinfomsg.Index = idx
-					break
+			if ifinfomsg.Index == 0 {
+				ifname = value.String()
+				for idx, ifa := range s.Interfaces() {
+					if ifname == ifa.Name {
+						ifinfomsg.Index = idx
+						break
+					}
 				}
 			}
 		case linux.IFLA_MASTER:
 		case linux.IFLA_LINKINFO:
 		case linux.IFLA_ADDRESS:
+		case linux.IFLA_MTU:
+		case linux.IFLA_NET_NS_FD:
+		case linux.IFLA_TXQLEN:
 		default:
 			ctx.Warningf("unexpected attribute: %x", attr)
 			return syserr.ErrNotSupported
@@ -153,7 +161,6 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 	if flags&(linux.NLM_F_EXCL|linux.NLM_F_REPLACE) != 0 {
 		return syserr.ErrExists
 	}
-
 	if ifinfomsg.Flags != 0 || ifinfomsg.Change != 0 {
 		if ifinfomsg.Change & ^uint32(linux.IFF_UP) != 0 {
 			ctx.Warningf("Unsupported ifi_change flags: %x", ifinfomsg.Change)
@@ -166,10 +173,34 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		// Netstack interfaces are always up.
 	}
 
-	return s.setLink(tcpip.NICID(ifinfomsg.Index), attrs)
+	return s.setLink(ctx, tcpip.NICID(ifinfomsg.Index), attrs)
 }
 
-func (s *Stack) setLink(id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
+func (s *Stack) setLink(ctx context.Context, id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
+	// IFLA_NET_NS_FD has to be handled first, because other parameters may be reseted.
+	if v, ok := linkAttrs[linux.IFLA_NET_NS_FD]; ok {
+		fd, ok := v.Uint32()
+		if !ok {
+			return syserr.ErrInvalidArgument
+		}
+		f := inet.NamespaceByFDFromContext(ctx)
+		if f == nil {
+			return syserr.ErrInvalidArgument
+		}
+		ns, err := f(int32(fd))
+		if err != nil {
+			return syserr.FromError(err)
+		}
+		defer ns.DecRef(ctx)
+		peer := ns.Stack().(*Stack)
+		if peer.Stack != s.Stack {
+			var err tcpip.Error
+			id, err = s.Stack.SetNICStack(id, peer.Stack)
+			if err != nil {
+				return syserr.TranslateNetstackError(err)
+			}
+		}
+	}
 	for t, v := range linkAttrs {
 		switch t {
 		case linux.IFLA_MASTER:
@@ -183,13 +214,27 @@ func (s *Stack) setLink(id tcpip.NICID, linkAttrs map[uint16]nlmsg.BytesView) *s
 				}
 			}
 		case linux.IFLA_ADDRESS:
-			addr, err := tcpip.ParseMACAddress(v.String())
-			if err != nil {
+			if len(v) != tcpip.LinkAddressSize {
 				return syserr.ErrInvalidArgument
 			}
+			addr := tcpip.LinkAddress(v)
 			if err := s.Stack.SetNICAddress(id, addr); err != nil {
 				return syserr.TranslateNetstackError(err)
 			}
+		case linux.IFLA_IFNAME:
+			if err := s.Stack.SetNICName(id, v.String()); err != nil {
+				return syserr.TranslateNetstackError(err)
+			}
+		case linux.IFLA_MTU:
+			mtu, ok := v.Uint32()
+			if !ok {
+				return syserr.ErrInvalidArgument
+			}
+			if err := s.Stack.SetNICMTU(id, mtu); err != nil {
+				return syserr.TranslateNetstackError(err)
+			}
+		case linux.IFLA_TXQLEN:
+			// TODO(b/340388892): support IFLA_TXQLEN.
 		}
 	}
 	return nil
@@ -247,8 +292,8 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 		}
 	}
 	ep, peerEP := veth.NewPair(defaultMTU)
-	id := tcpip.NICID(s.Stack.UniqueID())
-	peerID := tcpip.NICID(peerStack.Stack.UniqueID())
+	id := s.Stack.NextNICID()
+	peerID := peerStack.Stack.NextNICID()
 	if ifname == "" {
 		ifname = fmt.Sprintf("veth%d", id)
 	}
@@ -258,8 +303,7 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 	if err != nil {
 		return syserr.TranslateNetstackError(err)
 	}
-	ep.SetStack(s.Stack, id)
-	if err := s.setLink(id, linkAttrs); err != nil {
+	if err := s.setLink(ctx, id, linkAttrs); err != nil {
 		peerEP.Close()
 		return err
 	}
@@ -274,9 +318,8 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 		peerEP.Close()
 		return syserr.TranslateNetstackError(err)
 	}
-	peerEP.SetStack(peerStack.Stack, peerID)
 	if peerLinkAttrs != nil {
-		if err := s.setLink(peerID, peerLinkAttrs); err != nil {
+		if err := peerStack.setLink(ctx, peerID, peerLinkAttrs); err != nil {
 			peerStack.Stack.RemoveNIC(peerID)
 			peerEP.Close()
 			return err
@@ -293,14 +336,14 @@ func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesV
 		ifname = v.String()
 	}
 	ep := stack.NewBridgeEndpoint(defaultMTU)
-	id := tcpip.NICID(s.Stack.UniqueID())
+	id := s.Stack.NextNICID()
 	err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{
 		Name: ifname,
 	})
 	if err != nil {
 		return syserr.TranslateNetstackError(err)
 	}
-	if err := s.setLink(id, linkAttrs); err != nil {
+	if err := s.setLink(ctx, id, linkAttrs); err != nil {
 		return err
 	}
 
@@ -704,6 +747,154 @@ func (s *Stack) RouteTable() []inet.Route {
 	}
 
 	return routeTable
+}
+
+// localRoute constructs a local route from the netlink message.
+func (s *Stack) localRoute(msg *nlmsg.Message) (tcpip.Route, *syserr.Error) {
+	var rtMsg linux.RouteMessage
+	attrs, ok := msg.GetData(&rtMsg)
+	if !ok {
+		return tcpip.Route{}, syserr.ErrInvalidArgument
+	}
+
+	route := inet.Route{
+		Family:   rtMsg.Family,
+		DstLen:   rtMsg.DstLen,
+		SrcLen:   rtMsg.SrcLen,
+		TOS:      rtMsg.TOS,
+		Table:    rtMsg.Table,
+		Protocol: rtMsg.Protocol,
+		Scope:    rtMsg.Scope,
+		Type:     rtMsg.Type,
+		Flags:    rtMsg.Flags,
+	}
+
+	for !attrs.Empty() {
+		ahdr, value, rest, ok := attrs.ParseFirst()
+		if !ok {
+			return tcpip.Route{}, syserr.ErrInvalidArgument
+		}
+		attrs = rest
+
+		switch ahdr.Type {
+		case linux.RTA_DST:
+			if len(value) < 1 {
+				return tcpip.Route{}, syserr.ErrInvalidArgument
+			}
+			route.DstAddr = value
+		case linux.RTA_SRC:
+			if len(value) < 1 {
+				return tcpip.Route{}, syserr.ErrInvalidArgument
+			}
+			route.SrcAddr = value
+		case linux.RTA_OIF:
+			oif := nlmsg.BytesView(value)
+			outputInterface, ok := oif.Int32()
+			if !ok {
+				return tcpip.Route{}, syserr.ErrInvalidArgument
+			}
+			if _, exist := s.Interfaces()[outputInterface]; !exist {
+				return tcpip.Route{}, syserr.ErrNoDevice
+			}
+			route.OutputInterface = outputInterface
+		case linux.RTA_GATEWAY:
+			if len(value) < 1 {
+				return tcpip.Route{}, syserr.ErrInvalidArgument
+			}
+			route.GatewayAddr = value
+		case linux.RTA_PRIORITY:
+		default:
+			log.Warningf("Unknown attribute: %v", ahdr.Type)
+			return tcpip.Route{}, syserr.ErrNotSupported
+		}
+	}
+	var dest tcpip.Subnet
+	// When no destination address is provided, the new route might be the default route.
+	if route.DstAddr == nil {
+		if route.GatewayAddr == nil {
+			return tcpip.Route{}, syserr.ErrInvalidArgument
+		}
+		switch len(route.GatewayAddr) {
+		case header.IPv4AddressSize:
+			subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(tcpip.IPv4Zero), tcpip.MaskFromBytes(tcpip.IPv4Zero))
+			if err != nil {
+				return tcpip.Route{}, syserr.ErrInvalidArgument
+			}
+			dest = subnet
+		case header.IPv6AddressSize:
+			subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(tcpip.IPv6Zero), tcpip.MaskFromBytes(tcpip.IPv6Zero))
+			if err != nil {
+				return tcpip.Route{}, syserr.ErrInvalidArgument
+			}
+			dest = subnet
+		default:
+			return tcpip.Route{}, syserr.ErrInvalidArgument
+		}
+	} else {
+		dest = tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFromSlice(route.DstAddr),
+			PrefixLen: int(route.DstLen)}.Subnet()
+	}
+
+	localRoute := tcpip.Route{
+		Destination: dest,
+		Gateway:     tcpip.AddrFromSlice(route.GatewayAddr),
+		NIC:         tcpip.NICID(route.OutputInterface),
+	}
+
+	if len(route.SrcAddr) != 0 {
+		localRoute.SourceHint = tcpip.AddrFromSlice(route.SrcAddr)
+	}
+
+	return localRoute, nil
+}
+
+// RemoveRoute implements inte.Stack.RemoveRoute.
+func (s *Stack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	localRoute, err := s.localRoute(msg)
+	if err != nil {
+		return err
+	}
+	if removed := s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
+		// Both gateway and NIC are compared with existing routes
+		// only when they are present in the netlink message.
+		if localRoute.Gateway.Len() > 0 && !localRoute.Gateway.Equal(rt.Gateway) {
+			return false
+		}
+		if localRoute.NIC > 0 && localRoute.NIC != rt.NIC {
+			return false
+		}
+		return rt.Destination.Equal(localRoute.Destination)
+	}); removed == 0 {
+		return syserr.ErrNoProcess
+	}
+	return nil
+}
+
+// NewRoute implements inet.Stack.NewRoute.
+func (s *Stack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	localRoute, err := s.localRoute(msg)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, rt := range s.Stack.GetRouteTable() {
+		if localRoute.Equal(rt) {
+			found = true
+			break
+		}
+	}
+	flags := msg.Header().Flags
+	switch {
+	case !found && flags&linux.NLM_F_CREATE == linux.NLM_F_CREATE:
+		s.Stack.AddRoute(localRoute)
+	case found && flags&linux.NLM_F_REPLACE != linux.NLM_F_REPLACE:
+		return syserr.ErrExists
+	}
+	if flags&linux.NLM_F_REPLACE == linux.NLM_F_REPLACE {
+		s.Stack.ReplaceRoute(localRoute)
+	}
+	return nil
 }
 
 // IPTables returns the stack's iptables.

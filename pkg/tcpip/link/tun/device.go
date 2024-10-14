@@ -140,7 +140,7 @@ func attachOrCreateNIC(s *stack.Stack, name, prefix string, linkCaps stack.LinkE
 		}
 
 		// 2. Creating a new NIC.
-		id := tcpip.NICID(s.UniqueID())
+		id := s.NextNICID()
 		endpoint := &tunEndpoint{
 			Endpoint: channel.New(defaultDevOutQueueLen, defaultDevMtu, ""),
 			stack:    s,
@@ -332,6 +332,8 @@ func (d *Device) WriteNotify() {
 //
 // It is ref-counted as multiple opening files can attach to the same NIC.
 // The last owner is responsible for deleting the NIC.
+//
+// +stateify savable
 type tunEndpoint struct {
 	tunEndpointRefs
 	*channel.Endpoint

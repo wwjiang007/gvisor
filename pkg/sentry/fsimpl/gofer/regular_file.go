@@ -295,12 +295,9 @@ func (fd *regularFileFD) writeCache(ctx context.Context, d *dentry, offset int64
 	var freed []memmap.FileRange
 
 	d.dataMu.Lock()
-	cseg := d.cache.LowerBoundSegment(mr.Start)
-	for cseg.Ok() && cseg.Start() < mr.End {
-		cseg = d.cache.Isolate(cseg, mr)
+	d.cache.RemoveRangeWith(mr, func(cseg fsutil.FileRangeIterator) {
 		freed = append(freed, memmap.FileRange{cseg.Value(), cseg.Value() + cseg.Range().Length()})
-		cseg = d.cache.Remove(cseg).NextSegment()
-	}
+	})
 	d.dataMu.Unlock()
 
 	// Invalidate mappings of removed pages.
@@ -374,6 +371,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 	}
 
 	// Otherwise read from/through the cache.
+	memCgID := pgalloc.MemoryCgroupIDFromContext(rw.ctx)
 	mf := rw.d.fs.mf
 	fillCache := mf.ShouldCacheEvictable()
 	var dataMuUnlock func()
@@ -435,7 +433,11 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					End:   gapEnd,
 				}
 				optMR := gap.Range()
-				_, err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, usage.PageCache, pgalloc.AllocateAndWritePopulate, h.readToBlocksAt)
+				_, err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, pgalloc.AllocOpts{
+					Kind:    usage.PageCache,
+					MemCgID: memCgID,
+					Mode:    pgalloc.AllocateAndWritePopulate,
+				}, h.readToBlocksAt)
 				mf.MarkEvictable(rw.d, pgalloc.EvictableRange{optMR.Start, optMR.End})
 				seg, gap = rw.d.cache.Find(rw.off)
 				if !seg.Ok() {
@@ -773,6 +775,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		}, nil
 	}
 
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	d.dataMu.Lock()
 
 	// Constrain translations to d.size (rounded up) to prevent translation to
@@ -794,7 +797,11 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 
 	mf := d.fs.mf
 	h := d.readHandle()
-	_, cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, usage.PageCache, pgalloc.AllocateAndWritePopulate, h.readToBlocksAt)
+	_, cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, pgalloc.AllocOpts{
+		Kind:    usage.PageCache,
+		MemCgID: memCgID,
+		Mode:    pgalloc.AllocateAndWritePopulate,
+	}, h.readToBlocksAt)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64
@@ -802,10 +809,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 		segMR := seg.Range().Intersect(optional)
 		// TODO(jamieliu): Make Translations writable even if writability is
 		// not required if already kept-dirty by another writable translation.
-		perms := hostarch.AccessType{
-			Read:    true,
-			Execute: true,
-		}
+		perms := hostarch.ReadExecute
 		if at.Write {
 			// From this point forward, this memory can be dirtied through the
 			// mapping at any time.
@@ -951,6 +955,11 @@ func (d *dentryPlatformFile) MapInternal(fr memmap.FileRange, at hostarch.Access
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
 	return d.hostFileMapper.MapInternal(fr, int(d.mmapFD.RacyLoad()), at.Write)
+}
+
+// DataFD implements memmap.File.DataFD.
+func (d *dentryPlatformFile) DataFD(fr memmap.FileRange) (int, error) {
+	return d.FD(), nil
 }
 
 // FD implements memmap.File.FD.

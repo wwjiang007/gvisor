@@ -27,6 +27,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/version"
@@ -106,6 +107,9 @@ type Config struct {
 
 	// HostFifo controls permission to access host FIFO (or named pipes).
 	HostFifo HostFifo `flag:"host-fifo"`
+
+	// HostSettings controls how host settings are handled.
+	HostSettings HostSettingsPolicy `flag:"host-settings"`
 
 	// Network indicates what type of network to use.
 	Network NetworkType `flag:"network"`
@@ -308,6 +312,9 @@ type Config struct {
 	// exists, but is mostly idle. Not supported in rootless mode.
 	DirectFS bool `flag:"directfs"`
 
+	// AppHugePages enables support for application huge pages.
+	AppHugePages bool `flag:"app-huge-pages"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 
@@ -321,6 +328,10 @@ type Config struct {
 	// It can also be set to the special value "latest" to force the use of
 	// the latest supported NVIDIA driver ABI.
 	NVProxyDriverVersion string `flag:"nvproxy-driver-version"`
+
+	// NVProxyAllowUnsupportedCapabilities is a comma-separated list of driver
+	// capabilities that are allowed to be requested by the container.
+	NVProxyAllowedDriverCapabilities string `flag:"nvproxy-allowed-driver-capabilities"`
 
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
@@ -356,9 +367,8 @@ type Config struct {
 	// present, and reproduce them in the sandbox.
 	ReproduceNftables bool `flag:"reproduce-nftables"`
 
-	// NetDisconnectOk indicates whether the link endpoint capability
-	// CapabilityDisconnectOk should be set. This allows open connections to be
-	// disconnected upon save.
+	// Indicates whether open network connections and open unix domain
+	// sockets should be disconnected upon save."
 	NetDisconnectOk bool `flag:"net-disconnect-ok"`
 
 	// TestOnlyAutosaveImagePath if not empty enables auto save for syscall tests
@@ -367,6 +377,9 @@ type Config struct {
 
 	// TestOnlyAutosaveResume indicates save resume for syscall tests.
 	TestOnlyAutosaveResume bool `flag:"TESTONLY-autosave-resume"`
+
+	// TestOnlySaveRestoreNetstack indicates netstack should be saved and restored.
+	TestOnlySaveRestoreNetstack bool `flag:"TESTONLY-save-restore-netstack"`
 }
 
 func (c *Config) validate() error {
@@ -401,6 +414,18 @@ func (c *Config) validate() error {
 	}
 	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
 		return fmt.Errorf("profiling-metrics flag requires defining a profiling-metrics-log for output")
+	}
+	for _, cap := range strings.Split(c.NVProxyAllowedDriverCapabilities, ",") {
+		nvcap := nvconf.DriverCap(cap)
+		if nvcap == nvconf.AllCap {
+			continue
+		}
+		if _, ok := nvconf.KnownDriverCapValues[nvcap]; !ok {
+			return fmt.Errorf("nvproxy-allowed-driver-capabilities contains invalid capability %q", cap)
+		}
+		if _, ok := nvconf.SupportedDriverCaps[nvcap]; !ok {
+			log.Warningf("nvproxy-allowed-driver-capabilities contains unsupported capability %q", cap)
+		}
 	}
 	return nil
 }
@@ -591,6 +616,9 @@ const (
 
 	// NetworkNone sets up just loopback using netstack.
 	NetworkNone
+
+	// NetworkPlugin uses third-party network stack.
+	NetworkPlugin
 )
 
 func networkTypePtr(v NetworkType) *NetworkType {
@@ -606,6 +634,8 @@ func (n *NetworkType) Set(v string) error {
 		*n = NetworkHost
 	case "none":
 		*n = NetworkNone
+	case "plugin":
+		*n = NetworkPlugin
 	default:
 		return fmt.Errorf("invalid network type %q", v)
 	}
@@ -626,6 +656,8 @@ func (n NetworkType) String() string {
 		return "host"
 	case NetworkNone:
 		return "none"
+	case NetworkPlugin:
+		return "plugin"
 	}
 	panic(fmt.Sprintf("Invalid network type %d", n))
 }
@@ -939,6 +971,86 @@ func (o *Overlay2) SubMountOverlayMedium() OverlayMedium {
 		return NoOverlay
 	}
 	return o.medium
+}
+
+// HostSettingsPolicy dictates how host settings should be handled.
+type HostSettingsPolicy int
+
+// HostSettingsPolicy values.
+const (
+	// HostSettingsCheck checks the host settings. If any are not optimal, it
+	// will fail if any of them are mandatory, but will otherwise only log
+	// warnings. It never attempts to modify host settings.
+	HostSettingsCheck HostSettingsPolicy = iota
+
+	// HostSettingsCheck checks the host settings. If any are not optimal, it
+	// will fail if any of them are mandatory, but will otherwise not log
+	// anything about non-mandatory settings.
+	// It never attempts to modify host settings.
+	HostSettingsCheckMandatory
+
+	// HostSettingsIgnore does not check nor adjust any host settings.
+	// This is useful in case the host settings are already known to be
+	// optimal, or to avoid errors if `runsc` is running within a seccomp
+	// or AppArmor policy that prevents it from checking host settings.
+	HostSettingsIgnore
+
+	// HostSettingsAdjust automatically adjusts host settings if they are not
+	// optimal. It will fail if any setting is mandatory but cannot be adjusted.
+	// For non-mandatory settings, it logs a warning if adjustment fails.
+	HostSettingsAdjust
+
+	// HostSettingsEnforce automatically adjusts host settings if they are not
+	// optimal, and fails if adjustment of any setting fails.
+	HostSettingsEnforce
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (p *HostSettingsPolicy) Set(v string) error {
+	switch v {
+	case "check":
+		*p = HostSettingsCheck
+	case "check_mandatory":
+		*p = HostSettingsCheckMandatory
+	case "ignore":
+		*p = HostSettingsIgnore
+	case "adjust":
+		*p = HostSettingsAdjust
+	case "enforce":
+		*p = HostSettingsEnforce
+	default:
+		return fmt.Errorf("invalid host settings policy %q", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to `p`.
+// Useful in flag declaration line.
+func (p HostSettingsPolicy) Ptr() *HostSettingsPolicy {
+	return &p
+}
+
+// Get implements flag.Get.
+func (p *HostSettingsPolicy) Get() any {
+	return *p
+}
+
+// String implements flag.String.
+func (p HostSettingsPolicy) String() string {
+	switch p {
+	case HostSettingsCheck:
+		return "check"
+	case HostSettingsCheckMandatory:
+		return "check_mandatory"
+	case HostSettingsAdjust:
+		return "adjust"
+	case HostSettingsIgnore:
+		return "ignore"
+	case HostSettingsEnforce:
+		return "enforce"
+	default:
+		panic(fmt.Sprintf("Invalid host settings policy %d", p))
+	}
 }
 
 // XDP holds configuration for whether and how to use XDP.

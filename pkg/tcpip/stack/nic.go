@@ -103,7 +103,7 @@ func makeNICStats(global tcpip.NICStats) sharedStats {
 
 // +stateify savable
 type packetEndpointList struct {
-	mu packetEndpointListRWMutex
+	mu packetEndpointListRWMutex `state:"nosave"`
 
 	// eps is protected by mu, but the contained PacketEndpoint values are not.
 	//
@@ -311,7 +311,10 @@ func (n *nic) enable() tcpip.Error {
 // remove detaches NIC from the link endpoint and releases network endpoint
 // resources. This guarantees no packets between this NIC and the network
 // stack.
-func (n *nic) remove() tcpip.Error {
+//
+// It returns an action that has to be excuted after releasing the Stack lock
+// and any error encountered.
+func (n *nic) remove(closeLinkEndpoint bool) (func(), tcpip.Error) {
 	n.enableDisableMu.Lock()
 
 	n.disableLocked()
@@ -326,12 +329,20 @@ func (n *nic) remove() tcpip.Error {
 	// We must not hold n.enableDisableMu here.
 	n.linkResQueue.cancel()
 
+	var deferAct func()
 	// Prevent packets from going down to the link before shutting the link down.
 	n.qDisc.Close()
 	n.NetworkLinkEndpoint.Attach(nil)
-	n.NetworkLinkEndpoint.Close()
+	if closeLinkEndpoint {
+		ep := n.NetworkLinkEndpoint
+		ep.SetOnCloseAction(nil)
+		// The link endpoint has to be closed without holding a
+		// netstack lock, because it can trigger other netstack
+		// operations.
+		deferAct = ep.Close
+	}
 
-	return nil
+	return deferAct, nil
 }
 
 // setPromiscuousMode enables or disables promiscuous mode.

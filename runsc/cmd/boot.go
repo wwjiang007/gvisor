@@ -17,7 +17,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +28,7 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/coretag"
 	"gvisor.dev/gvisor/pkg/cpuid"
@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -47,21 +48,29 @@ import (
 
 // Note that directfsSandboxCaps is the same as caps defined in gofer.go
 // except CAP_SYS_CHROOT because we don't need to chroot in directfs mode.
-var directfsSandboxCaps = []string{
-	"CAP_CHOWN",
-	"CAP_DAC_OVERRIDE",
-	"CAP_DAC_READ_SEARCH",
-	"CAP_FOWNER",
-	"CAP_FSETID",
-}
+var (
+	directfsSandboxCaps = []string{
+		"CAP_CHOWN",
+		"CAP_DAC_OVERRIDE",
+		"CAP_DAC_READ_SEARCH",
+		"CAP_FOWNER",
+		"CAP_FSETID",
+	}
 
-// directfsSandboxLinuxCaps is the minimal set of capabilities needed by the
-// sandbox to operate on files in directfs mode.
-var directfsSandboxLinuxCaps = &specs.LinuxCapabilities{
-	Bounding:  directfsSandboxCaps,
-	Effective: directfsSandboxCaps,
-	Permitted: directfsSandboxCaps,
-}
+	// directfsSandboxLinuxCaps is the minimal set of capabilities needed by the
+	// sandbox to operate on files in directfs mode.
+	directfsSandboxLinuxCaps = &specs.LinuxCapabilities{
+		Bounding:  directfsSandboxCaps,
+		Effective: directfsSandboxCaps,
+		Permitted: directfsSandboxCaps,
+	}
+
+	hostnetSandboxLinuxCaps = map[capability.Cap]string{
+		capability.CAP_NET_ADMIN:        "CAP_NET_ADMIN",
+		capability.CAP_NET_BIND_SERVICE: "CAP_NET_BIND_SERVICE",
+		capability.CAP_NET_RAW:          "CAP_NET_RAW",
+	}
+)
 
 // Boot implements subcommands.Command for the "boot" command which starts a
 // new sandbox. It should not be called directly.
@@ -140,9 +149,6 @@ type Boot struct {
 
 	saveFDs intFlags
 
-	// pidns is set if the sandbox is in its own pid namespace.
-	pidns bool
-
 	// attached is set to true to kill the sandbox process when the parent process
 	// terminates. This flag is set when the command execve's itself because
 	// parent death signal doesn't propagate through execve when uid/gid changes.
@@ -151,6 +157,9 @@ type Boot struct {
 	// productName is the value to show in
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
+
+	// Value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host.
+	hostShmemHuge string
 
 	// FDs for profile data.
 	profileFDs profile.FDArgs
@@ -195,7 +204,6 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&b.bundleDir, "bundle", "", "required path to the root of the bundle directory")
 	f.BoolVar(&b.applyCaps, "apply-caps", false, "if true, apply capabilities defined in the spec to the process")
 	f.BoolVar(&b.setUpRoot, "setup-root", false, "if true, set up an empty root for the process")
-	f.BoolVar(&b.pidns, "pidns", false, "if true, the sandbox is in its own PID namespace")
 	f.IntVar(&b.cpuNum, "cpu-num", 0, "number of CPUs to create inside the sandbox")
 	f.IntVar(&b.procMountSyncFD, "proc-mount-sync-fd", -1, "file descriptor that has to be written to when /proc isn't needed anymore and can be unmounted")
 	f.IntVar(&b.syncUsernsFD, "sync-userns-fd", -1, "file descriptor used to synchronize rootless user namespace initialization.")
@@ -204,6 +212,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
 	f.StringVar(&b.productName, "product-name", "", "value to show in /sys/devices/virtual/dmi/id/product_name")
 	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
+	f.StringVar(&b.hostShmemHuge, "host-shmem-huge", "", "value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host")
 
 	// Open FDs that are donated to the sandbox.
 	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
@@ -249,14 +258,25 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	ring0.InitDefault()
 
 	argOverride := make(map[string]string)
+
+	// Do these before chroot takes effect, otherwise we can't read /sys.
 	if len(b.productName) == 0 {
-		// Do this before chroot takes effect, otherwise we can't read /sys.
-		if product, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
+		if product, err := os.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
 			log.Warningf("Not setting product_name: %v", err)
 		} else {
 			b.productName = strings.TrimSpace(string(product))
 			log.Infof("Setting product_name: %q", b.productName)
 			argOverride["product-name"] = b.productName
+		}
+	}
+	if conf.AppHugePages && len(b.hostShmemHuge) == 0 {
+		hostShmemHuge, err := hostmm.GetTransparentHugepageEnum("shmem_enabled")
+		if err != nil {
+			log.Warningf("Failed to infer --host-shmem-huge: %v", err)
+		} else {
+			b.hostShmemHuge = hostShmemHuge
+			log.Infof("Setting host-shmem-huge: %q", b.hostShmemHuge)
+			argOverride["host-shmem-huge"] = b.hostShmemHuge
 		}
 	}
 
@@ -284,7 +304,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 
 	if b.setUpRoot {
-		if err := setUpChroot(b.pidns, spec, conf); err != nil {
+		if err := setUpChroot(spec, conf); err != nil {
 			util.Fatalf("error setting up chroot: %v", err)
 		}
 		argOverride["setup-root"] = "false"
@@ -330,10 +350,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	if b.applyCaps {
-		caps := spec.Process.Capabilities
-		if caps == nil {
-			caps = &specs.LinuxCapabilities{}
-		}
+		caps := &specs.LinuxCapabilities{}
 
 		gPlatform, err := platform.Lookup(conf.Platform)
 		if err != nil {
@@ -349,6 +366,31 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 		if conf.DirectFS {
 			caps = specutils.MergeCapabilities(caps, directfsSandboxLinuxCaps)
+		}
+		if conf.Network == config.NetworkHost {
+			curCaps, err := capability.NewPid2(0)
+			if err != nil {
+				util.Fatalf("capability.NewPid2(0) failed: %v", err)
+			}
+			if err := curCaps.Load(); err != nil {
+				util.Fatalf("unable to load capabilities: %v", err)
+			}
+			addCaps := []string{}
+			for c, strCap := range hostnetSandboxLinuxCaps {
+				if c == capability.CAP_NET_RAW && !conf.EnableRaw {
+					continue
+				}
+				if curCaps.Get(capability.PERMITTED, c) {
+					addCaps = append(addCaps, strCap)
+				}
+			}
+			if len(addCaps) != 0 {
+				caps = specutils.MergeCapabilities(caps, &specs.LinuxCapabilities{
+					Bounding:  addCaps,
+					Effective: addCaps,
+					Permitted: addCaps,
+				})
+			}
 		}
 		argOverride["apply-caps"] = "false"
 
@@ -456,6 +498,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		SinkFDs:             b.sinkFDs.GetArray(),
 		ProfileOpts:         b.profileFDs.ToOpts(),
 		NvidiaDriverVersion: b.nvidiaDriverVersion,
+		HostShmemHuge:       b.hostShmemHuge,
 		SaveFDs:             b.saveFDs.GetFDs(),
 	}
 	l, err := boot.New(bootArgs)

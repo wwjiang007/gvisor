@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,7 +34,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -194,7 +192,7 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 	if _, err := specFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
 	}
-	specBytes, err := ioutil.ReadAll(specFile)
+	specBytes, err := io.ReadAll(specFile)
 	if err != nil {
 		return nil, fmt.Errorf("error reading spec from file %q: %v", specFile.Name(), err)
 	}
@@ -274,7 +272,7 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 
 // ReadMounts reads mount list from a file.
 func ReadMounts(f *os.File) ([]specs.Mount, error) {
-	bytes, err := ioutil.ReadAll(f)
+	bytes, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("error reading mounts: %v", err)
 	}
@@ -528,12 +526,12 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 //     <yyyymmdd-hhmmss.uuuuuu>
 //   - %COMMAND%: is replaced with 'command'
 //   - %TEST%: is replaced with 'test' (omitted by default)
-func DebugLogFile(logPattern, command, test string) (*os.File, error) {
+func DebugLogFile(logPattern, command, test string, timestamp time.Time) (*os.File, error) {
 	if strings.HasSuffix(logPattern, "/") {
 		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>.txt
 		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%.txt"
 	}
-	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", time.Now().Format("20060102-150405.000000"), -1)
+	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", timestamp.Format("20060102-150405.000000"), -1)
 	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)
 	logPattern = strings.Replace(logPattern, "%TEST%", test, -1)
 
@@ -577,7 +575,7 @@ func TPUProxyIsEnabled(spec *specs.Spec, conf *config.Config) bool {
 // VFIOFunctionalityRequested returns true if the container should have access
 // to VFIO functionality.
 func VFIOFunctionalityRequested(dev *specs.LinuxDevice) bool {
-	return strings.HasPrefix(dev.Path, filepath.Dir(tpuproxy.VFIOPath))
+	return strings.HasPrefix(dev.Path, "/dev/vfio")
 }
 
 // AcceleratorFunctionalityRequested returns true if the container should have
@@ -696,7 +694,7 @@ func RetryEintr(f func() (uintptr, uintptr, error)) (uintptr, uintptr, error) {
 
 // GetOOMScoreAdj reads the given process' oom_score_adj
 func GetOOMScoreAdj(pid int) (int, error) {
-	data, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid))
 	if err != nil {
 		return 0, err
 	}

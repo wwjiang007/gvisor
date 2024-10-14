@@ -85,6 +85,12 @@ type Stack interface {
 	// RouteTable returns the network stack's route table.
 	RouteTable() []Route
 
+	// RemoveRoute deletes the specified route.
+	RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
+
+	// NewRoute adds the given route to the network stack's route table.
+	NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
+
 	// Pause pauses the network stack before save.
 	Pause()
 
@@ -117,6 +123,9 @@ type Stack interface {
 	// SetPortRange sets the UDP and TCP IPv4 and IPv6 ephemeral port range
 	// (inclusive).
 	SetPortRange(start uint16, end uint16) error
+
+	// EnableSaveRestore enables netstack s/r.
+	EnableSaveRestore() error
 }
 
 // Interface contains information about a network interface.

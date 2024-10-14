@@ -136,6 +136,14 @@ func Filters() seccomp.SyscallRules {
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_ENABLE_PEER_ACCESS),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_DISABLE_PEER_ACCESS),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(nvgpu.UVM_SET_RANGE_GROUP),
 			},
 			seccomp.PerArg{
@@ -164,7 +172,19 @@ func Filters() seccomp.SyscallRules {
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_UNSET_PREFERRED_LOCATION),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(nvgpu.UVM_DISABLE_READ_DUPLICATION),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_UNSET_ACCESSED_BY),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_MIGRATE),
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
@@ -181,6 +201,10 @@ func Filters() seccomp.SyscallRules {
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(nvgpu.UVM_MAP_DYNAMIC_PARALLELISM_REGION),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(nvgpu.UVM_UNMAP_EXTERNAL),
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},

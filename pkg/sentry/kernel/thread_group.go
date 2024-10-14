@@ -49,14 +49,23 @@ type ThreadGroup struct {
 	// signalHandlers. (This is analogous to Linux's use of struct
 	// sighand_struct::siglock.)
 	//
-	// The signalHandlers pointer can only be mutated during an execve
-	// (Task.finishExec). Consequently, when it's possible for a task in the
-	// thread group to be completing an execve, signalHandlers is protected by
-	// the owning TaskSet.mu. Otherwise, it is possible to read the
-	// signalHandlers pointer without synchronization. In particular,
-	// completing an execve requires that all other tasks in the thread group
-	// have exited, so task goroutines do not need the owning TaskSet.mu to
-	// read the signalHandlers pointer of their thread groups.
+	// The signalHandlers pointer is only mutated during execve
+	// (Task.finishExec), which occurs with TaskSet.mu and (the previous)
+	// signalHandlers.mu locked. Consequently:
+	//
+	// - Completing an execve requires that all other tasks in the thread group
+	// have exited, so task goroutines for non-exiting tasks in the thread
+	// group can read signalHandlers without a race condition.
+	//
+	// - If TaskSet.mu is locked (for reading or writing), any goroutine may
+	// read signalHandlers without a race condition.
+	//
+	// - If it is impossible for a task in the thread group to be completing an
+	// execve for another reason, any goroutine may read signalHandlers without
+	// a race condition.
+	//
+	// - Otherwise, ThreadGroup.signalLock() should be used to non-racily lock
+	// signalHandlers.mu; it also returns the locked signalHandlers.
 	signalHandlers *SignalHandlers
 
 	// pendingSignals is the set of pending signals that may be handled by any
@@ -195,7 +204,11 @@ type ThreadGroup struct {
 	nextTimerID linux.TimerID
 
 	// exitedCPUStats is the CPU usage for all exited tasks in the thread
-	// group. exitedCPUStats is protected by the TaskSet mutex.
+	// group. exitedCPUStats is protected by both the TaskSet mutex and the
+	// signal mutex. Mutating it requires that the TaskSet mutex is locked for
+	// writing *and* that the signal mutex is locked. Reading it requires
+	// locking the TaskSet mutex (for reading or writing) *or* locking the
+	// signal mutex.
 	exitedCPUStats usage.CPUStats
 
 	// childCPUStats is the CPU usage of all joined descendants of this thread
@@ -298,12 +311,19 @@ func (tg *ThreadGroup) loadOldRSeqCritical(_ goContext.Context, r *OldRSeqCritic
 	tg.oldRSeqCritical.Store(r)
 }
 
-// SignalHandlers returns the signal handlers used by tg.
-//
-// Preconditions: The caller must provide the synchronization required to read
-// tg.signalHandlers, as described in the field's comment.
-func (tg *ThreadGroup) SignalHandlers() *SignalHandlers {
-	return tg.signalHandlers
+// signalLock atomically locks tg.SignalHandlers().mu and returns the
+// SignalHandlers.
+func (tg *ThreadGroup) signalLock() *SignalHandlers {
+	sh := tg.SignalHandlers()
+	for {
+		sh.mu.Lock()
+		sh2 := tg.SignalHandlers()
+		if sh == sh2 {
+			return sh
+		}
+		sh.mu.Unlock()
+		sh = sh2
+	}
 }
 
 // Limits returns tg's limits.
@@ -317,23 +337,28 @@ func (tg *ThreadGroup) Release(ctx context.Context) {
 	// since timers send signals with Timer.mu locked.
 	tg.itimerRealTimer.Destroy()
 	var its []*IntervalTimer
-	tg.pidns.owner.mu.Lock()
 	tg.signalHandlers.mu.Lock()
 	for _, it := range tg.timers {
 		its = append(its, it)
 	}
 	clear(tg.timers) // nil maps can't be saved
 	// Disassociate from the tty if we have one.
+	var tty *TTY
 	if tg.tty != nil {
-		tg.tty.mu.Lock()
-		if tg.tty.tg == tg {
-			tg.tty.tg = nil
-		}
-		tg.tty.mu.Unlock()
-		tg.tty = nil
+		// Can't lock tty.mu due to lock ordering.
+		tty = tg.tty
 	}
 	tg.signalHandlers.mu.Unlock()
-	tg.pidns.owner.mu.Unlock()
+	if tty != nil {
+		tty.mu.Lock()
+		tg.signalHandlers.mu.Lock()
+		tg.tty = nil
+		if tty.tg == tg {
+			tty.tg = nil
+		}
+		tg.signalHandlers.mu.Unlock()
+		tty.mu.Unlock()
+	}
 	for _, it := range its {
 		it.DestroyTimer()
 	}
@@ -372,8 +397,16 @@ func (tg *ThreadGroup) walkDescendantThreadGroupsLocked(visitor func(*ThreadGrou
 	}
 }
 
+// TTY returns the thread group's controlling terminal. If nil, there is no
+// controlling terminal.
+func (tg *ThreadGroup) TTY() *TTY {
+	sh := tg.signalLock()
+	defer sh.mu.Unlock()
+	return tg.tty
+}
+
 // SetControllingTTY sets tty as the controlling terminal of tg.
-func (tg *ThreadGroup) SetControllingTTY(tty *TTY, steal bool, isReadable bool) error {
+func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bool, isReadable bool) error {
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
@@ -391,11 +424,9 @@ func (tg *ThreadGroup) SetControllingTTY(tty *TTY, steal bool, isReadable bool) 
 	}
 	if tg.tty == tty {
 		return nil
-	} else if tg.tty != nil {
-		return linuxerr.EINVAL
 	}
 
-	creds := auth.CredentialsFromContext(tg.leader)
+	creds := auth.CredentialsFromContext(ctx)
 	hasAdmin := creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, creds.UserNamespace.Root())
 
 	// "If this terminal is already the controlling terminal of a different
@@ -494,24 +525,34 @@ func (tg *ThreadGroup) ReleaseControllingTTY(tty *TTY) error {
 	return lastErr
 }
 
-// ForegroundProcessGroupID returns the foreground process group ID of the
-// thread group.
-func (tg *ThreadGroup) ForegroundProcessGroupID(tty *TTY) (ProcessGroupID, error) {
+// ForegroundProcessGroup returns the foreground process group of the thread
+// group.
+func (tg *ThreadGroup) ForegroundProcessGroup(tty *TTY) (*ProcessGroup, error) {
 	tty.mu.Lock()
 	defer tty.mu.Unlock()
 
-	tg.pidns.owner.mu.Lock()
-	defer tg.pidns.owner.mu.Unlock()
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
 	tg.signalHandlers.mu.Lock()
 	defer tg.signalHandlers.mu.Unlock()
 
 	// fd must refer to the controlling terminal of the calling process.
 	// See tcgetpgrp(3)
 	if tg.tty != tty {
-		return 0, linuxerr.ENOTTY
+		return nil, linuxerr.ENOTTY
 	}
 
-	return tg.processGroup.session.foreground.id, nil
+	return tg.processGroup.session.foreground, nil
+}
+
+// ForegroundProcessGroupID returns the foreground process group ID of the
+// thread group.
+func (tg *ThreadGroup) ForegroundProcessGroupID(tty *TTY) (ProcessGroupID, error) {
+	pg, err := tg.ForegroundProcessGroup(tty)
+	if err != nil {
+		return 0, err
+	}
+	return pg.id, nil
 }
 
 // SetForegroundProcessGroupID sets the foreground process group of tty to

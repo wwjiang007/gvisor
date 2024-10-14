@@ -22,6 +22,7 @@ import (
 
 var _ NetworkLinkEndpoint = (*BridgeEndpoint)(nil)
 
+// +stateify savable
 type bridgePort struct {
 	bridge *BridgeEndpoint
 	nic    *nic
@@ -36,7 +37,7 @@ func (p *bridgePort) ParseHeader(pkt *PacketBuffer) bool {
 // DeliverNetworkPacket implements stack.NetworkDispatcher.
 func (p *bridgePort) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) {
 	bridge := p.bridge
-	bridge.mu.Lock()
+	bridge.mu.RLock()
 
 	// Send the packet to all other ports.
 	for _, port := range bridge.ports {
@@ -52,7 +53,7 @@ func (p *bridgePort) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, 
 	}
 
 	d := bridge.dispatcher
-	bridge.mu.Unlock()
+	bridge.mu.RUnlock()
 	if d != nil {
 		// The dispatcher may acquire Stack.mu in DeliverNetworkPacket(), which is
 		// ordered above bridge.mu. So call DeliverNetworkPacket() without holding
@@ -75,8 +76,10 @@ func NewBridgeEndpoint(mtu uint32) *BridgeEndpoint {
 }
 
 // BridgeEndpoint is a bridge endpoint.
+//
+// +stateify savable
 type BridgeEndpoint struct {
-	mu bridgeRWMutex
+	mu bridgeRWMutex `state:"nosave"`
 	// +checklocks:mu
 	ports map[tcpip.NICID]*bridgePort
 	// +checklocks:mu
@@ -224,3 +227,6 @@ func (b *BridgeEndpoint) ParseHeader(*PacketBuffer) bool {
 
 // Close implements stack.LinkEndpoint.Close.
 func (b *BridgeEndpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.Close.
+func (b *BridgeEndpoint) SetOnCloseAction(func()) {}

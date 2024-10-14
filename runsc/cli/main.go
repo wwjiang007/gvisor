@@ -19,7 +19,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/signal"
 	"runtime"
@@ -41,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -87,7 +87,7 @@ func Main() {
 	// Create a new Config from the flags.
 	conf, err := config.NewFromFlags(flag.CommandLine)
 	if err != nil {
-		util.Fatalf(err.Error())
+		util.Fatalf("%s", err.Error())
 	}
 
 	var errorLogger io.Writer
@@ -133,6 +133,9 @@ func Main() {
 	// case that does not occur.
 	_ = time.Local.String()
 
+	// Set the start time as soon as possible.
+	startTime := starttime.Get()
+
 	var emitters log.MultiEmitter
 	if *debugLogFD > -1 {
 		f := os.NewFile(uintptr(*debugLogFD), "debug log file")
@@ -140,7 +143,7 @@ func Main() {
 		emitters = append(emitters, newEmitter(conf.DebugLogFormat, f))
 
 	} else if len(conf.DebugLog) > 0 && specutils.IsDebugCommand(conf, subcommand) {
-		f, err := specutils.DebugLogFile(conf.DebugLog, subcommand, "" /* name */)
+		f, err := specutils.DebugLogFile(conf.DebugLog, subcommand, "" /* name */, startTime)
 		if err != nil {
 			util.Fatalf("error opening debug log file in %q: %v", conf.DebugLog, err)
 		}
@@ -149,7 +152,7 @@ func Main() {
 	} else {
 		// Stderr is reserved for the application, just discard the logs if no debug
 		// log is specified.
-		emitters = append(emitters, newEmitter("text", ioutil.Discard))
+		emitters = append(emitters, newEmitter("text", io.Discard))
 	}
 
 	if *panicLogFD > -1 || *debugLogFD > -1 {

@@ -16,11 +16,11 @@ package nvproxy
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
@@ -76,7 +76,9 @@ func (dev *frontendDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.D
 		unix.Close(hostFD)
 		return nil, err
 	}
-	if err := fdnotifier.AddFD(int32(hostFD), &fd.queue); err != nil {
+	fd.internalEntry.Init(fd, waiter.AllEvents)
+	fd.internalQueue.EventRegister(&fd.internalEntry)
+	if err := fdnotifier.AddFD(int32(hostFD), &fd.internalQueue); err != nil {
 		unix.Close(hostFD)
 		return nil, err
 	}
@@ -102,8 +104,37 @@ type frontendFD struct {
 	hostFD        int32
 	memmapFile    frontendFDMemmapFile
 
-	queue           waiter.Queue
-	haveMmapContext atomic.Bool `state:"nosave"`
+	// The driver's implementation of poll() for these files,
+	// kernel-open/nvidia/nv.c:nvidia_poll(), unsets
+	// nv_linux_file_private_t::dataless_event_pending if it's set. This makes
+	// notifications from dataless_event_pending edge-triggered; a host poll()
+	// or epoll_wait() that returns the notification consumes it, preventing
+	// future calls to poll() or epoll_wait() from observing the same
+	// notification again.
+	//
+	// This is problematic in gVisor: fdnotifier, which epoll_wait()s on an
+	// epoll instance that includes our hostFD, will forward notifications to
+	// registered waiters, but this typically only wakes up blocked task
+	// goroutines which will later call vfs.FileDescription.Readiness() to get
+	// the FD's most up-to-date state. If our implementation of Readiness()
+	// just polls the underlying host FD, it will no longer observe the
+	// consumed notification.
+	//
+	// To work around this, intercept all events from fdnotifier and cache them
+	// for the first following call to Readiness(), essentially replicating the
+	// driver's behavior.
+	internalQueue waiter.Queue
+	internalEntry waiter.Entry
+	cachedEvents  atomicbitops.Uint64
+	appQueue      waiter.Queue
+
+	// mmapMu protects the following fields.
+	mmapMu frontendMmapMutex `state:"nosave"`
+	// These fields are marked nosave since we do not automatically reinvoke
+	// NV_ESC_RM_MAP_MEMORY after restore, so restored FDs have no
+	// mmap_context.
+	mmapLength   uint64  `state:"nosave"`
+	mmapInternal uintptr `state:"nosave"`
 
 	// clients are handles of clients owned by this frontendFD. clients is
 	// protected by dev.nvp.objsMu.
@@ -112,8 +143,14 @@ type frontendFD struct {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *frontendFD) Release(ctx context.Context) {
+	fd.mmapMu.Lock()
+	if fd.mmapInternal != 0 {
+		unix.RawSyscall(unix.SYS_MUNMAP, fd.mmapInternal, uintptr(fd.mmapLength), 0)
+	}
+	fd.mmapMu.Unlock()
+
 	fdnotifier.RemoveFD(fd.hostFD)
-	fd.queue.Notify(waiter.EventHUp)
+	fd.appQueue.Notify(waiter.EventHUp)
 
 	fd.dev.nvp.fdsMu.Lock()
 	delete(fd.dev.nvp.frontendFDs, fd)
@@ -131,25 +168,54 @@ func (fd *frontendFD) Release(ctx context.Context) {
 
 // EventRegister implements waiter.Waitable.EventRegister.
 func (fd *frontendFD) EventRegister(e *waiter.Entry) error {
-	fd.queue.EventRegister(e)
-	if err := fdnotifier.UpdateFD(fd.hostFD); err != nil {
-		fd.queue.EventUnregister(e)
-		return err
-	}
+	fd.appQueue.EventRegister(e)
 	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (fd *frontendFD) EventUnregister(e *waiter.Entry) {
-	fd.queue.EventUnregister(e)
-	if err := fdnotifier.UpdateFD(fd.hostFD); err != nil {
-		panic(fmt.Sprint("UpdateFD:", err))
-	}
+	fd.appQueue.EventUnregister(e)
 }
 
 // Readiness implements waiter.Waitable.Readiness.
 func (fd *frontendFD) Readiness(mask waiter.EventMask) waiter.EventMask {
-	return fdnotifier.NonBlockingPoll(fd.hostFD, mask)
+	for {
+		cachedEvents := waiter.EventMask(fd.cachedEvents.Load())
+		maskedEvents := cachedEvents & mask
+		if maskedEvents == 0 {
+			// Poll for all events and cache any not consumed by this call.
+			events := fdnotifier.NonBlockingPoll(fd.hostFD, waiter.AllEvents)
+			if unmaskedEvents := events &^ mask; unmaskedEvents != 0 {
+				fd.cacheEvents(unmaskedEvents)
+			}
+			return events & mask
+		}
+		if fd.cachedEvents.CompareAndSwap(uint64(cachedEvents), uint64(cachedEvents&^maskedEvents)) {
+			return maskedEvents
+		}
+	}
+}
+
+func (fd *frontendFD) cacheEvents(mask waiter.EventMask) {
+	for {
+		oldEvents := waiter.EventMask(fd.cachedEvents.Load())
+		newEvents := oldEvents | mask
+		if oldEvents == newEvents {
+			break
+		}
+		if fd.cachedEvents.CompareAndSwap(uint64(oldEvents), uint64(newEvents)) {
+			break
+		}
+	}
+}
+
+// NotifyEvent implements waiter.EventListener.NotifyEvent.
+func (fd *frontendFD) NotifyEvent(mask waiter.EventMask) {
+	// Events must be cached before notifying fd.appQueue, in order to ensure
+	// that the first notified waiter to call fd.Readiness() sees the
+	// newly-cached events.
+	fd.cacheEvents(mask)
+	fd.appQueue.Notify(mask)
 }
 
 // Epollable implements vfs.FileDescriptionImpl.Epollable.
@@ -564,6 +630,34 @@ func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *front
 	return n, nil
 }
 
+func ctrlMemoryMulticastFabricAttachGPU(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
+	var ctrlParams nvgpu.NV00FD_CTRL_ATTACH_GPU_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	origDevDescriptor := ctrlParams.DevDescriptor
+	devDescriptor, _ := fi.t.FDTable().Get(int32(origDevDescriptor))
+	if devDescriptor == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer devDescriptor.DecRef(fi.ctx)
+	devDesc, ok := devDescriptor.Impl().(*frontendFD)
+	if !ok {
+		return 0, linuxerr.EINVAL
+	}
+
+	ctrlParams.DevDescriptor = uint64(devDesc.hostFD)
+	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
+	ctrlParams.DevDescriptor = origDevDescriptor
+	// Note that ctrlParams.CopyOut() is not called here because
+	// NV00FD_CTRL_ATTACH_GPU_PARAMS is an input-only parameter.
+	return n, err
+}
+
 func ctrlClientSystemGetBuildVersion(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
 	var ctrlParams nvgpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
@@ -683,6 +777,27 @@ func ctrlSubdevFIFODisableChannels(fi *frontendIoctlState, ioctlParams *nvgpu.NV
 	return n, nil
 }
 
+func ctrlGpuGetIDInfo(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54Parameters) (uintptr, error) {
+	var ctrlParams nvgpu.NV0000_CTRL_GPU_GET_ID_INFO_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	// szName is not used anywhere in the driver, so we explicitly set it to null.
+	// See src/nvidia/src/kernel/gpu_mgr/gpu_mgr.c::gpumgrGetGpuIdInfo().
+	ctrlParams.SzName = 0
+
+	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
+	if err != nil {
+		return n, err
+	}
+	_, err = ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params))
+	return n, err
+}
+
 func rmAlloc(fi *frontendIoctlState) (uintptr, error) {
 	var isNVOS64 bool
 	switch fi.ioctlParamsSize {
@@ -756,6 +871,12 @@ func rmAllocSimpleParams[Params any, PtrParams marshalPtr[Params]](fi *frontendI
 
 	var allocParamsValue Params
 	allocParams := PtrParams(&allocParamsValue)
+	// Sometimes, the params are optional, in which case the size is 0.
+	if ioctlParams.ParamsSize != 0 && allocParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		fi.ctx.Warningf("nvproxy: mismatched param sizes for alloc class %v. Param struct has size %v, got %v (bytes).",
+			ioctlParams.HClass, allocParams.SizeBytes(), ioctlParams.ParamsSize)
+		return 0, linuxerr.EINVAL
+	}
 	if _, err := allocParams.CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
 		return 0, err
 	}
@@ -911,17 +1032,21 @@ func rmMapMemory(fi *frontendIoctlState) (uintptr, error) {
 	if !ok {
 		return 0, linuxerr.EINVAL
 	}
-	if mapFile.haveMmapContext.Load() || !mapFile.haveMmapContext.CompareAndSwap(false, true) {
+
+	mapFile.mmapMu.Lock()
+	defer mapFile.mmapMu.Unlock()
+	if mapFile.mmapLength != 0 {
 		fi.ctx.Warningf("nvproxy: attempted to reuse FD %d for NV_ESC_RM_MAP_MEMORY", ioctlParams.FD)
 		return 0, linuxerr.EINVAL
 	}
+
 	origFD := ioctlParams.FD
 	ioctlParams.FD = mapFile.hostFD
-
 	n, err := frontendIoctlInvoke(fi, &ioctlParams)
 	if err != nil {
 		return n, err
 	}
+	mapFile.mmapLength = ioctlParams.Params.Length
 
 	ioctlParams.FD = origFD
 	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
